@@ -140,12 +140,20 @@ Chinese docs:
 
 ## Release Artifacts
 
-Build optimized binaries with Cargo:
+`cargo build --release` only creates optimized build outputs. Final release archives are produced by the packaging script:
 
 ```bash
-cargo build --release
+python scripts/package-release.py --clean
 ```
 
-This produces `codeorbit-host` and `codeorbit-bridge` (with a `.exe` suffix on Windows) under `target/release/`. Package them together with a `runtime-manifest.json` into a release ZIP. The Windows HUD can download update manifests and promote the ZIP payload into its local cache.
+The script reads the single version source from root `Cargo.toml`, builds release binaries, stages only `codeorbit-host`, `codeorbit-bridge`, `bundled-plugins/`, `runtime-manifest.json`, and `LICENSE`, then writes one archive per target under `release/`.
+
+Build extra target archives by repeating `--target`:
+
+```bash
+python scripts/package-release.py --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-gnu
+```
+
+The script does not install Rust targets or cross-linkers. Install the target toolchain first when cross-packaging.
 
 <center>This project has been shared on the [LINUX DO](https://linux.do).</center>

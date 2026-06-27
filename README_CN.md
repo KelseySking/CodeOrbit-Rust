@@ -140,13 +140,21 @@ let installed = codeorbit_hub::config_installer::install_plugin("my-cli");
 
 ## 发布产物
 
-用 Cargo 构建发布版二进制：
+`cargo build --release` 只生成优化编译产物，不是最终发版包。最终压缩包用发版脚本生成：
 
 ```bash
-cargo build --release
+python scripts/package-release.py --clean
 ```
 
-产物为 `codeorbit-host` 与 `codeorbit-bridge`（Windows 上带 `.exe` 后缀），位于 `target/release/`。将它们与 `runtime-manifest.json` 一起打包为发布 ZIP。Windows HUD 可以读取更新 manifest，下载 ZIP，并把 payload 提升到本机缓存目录。
+脚本从根 `Cargo.toml` 读取唯一版本号，构建 release 二进制，只暂存 `codeorbit-host`、`codeorbit-bridge`、`bundled-plugins/`、`runtime-manifest.json` 和 `LICENSE`，并在 `release/` 下按 target 分别生成压缩包。
+
+重复传入 `--target` 可以生成多个目标包：
+
+```bash
+python scripts/package-release.py --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-gnu
+```
+
+脚本不负责安装 Rust target 或交叉链接工具链；跨平台打包前需要先准备对应构建环境。
 
 ## 前端集成建议
 
