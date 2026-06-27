@@ -1,0 +1,27 @@
+# Rust 构建产物
+/target
+**/*.rs.bk
+*.pdb
+
+# 本地工作流 / 代理状态（不入库）
+.agents/
+.codex/
+.trellis/
+.claude/
+.spec-workflow/
+AGENTS.md
+CLAUDE.md
+
+# IDE / 编辑器 / 操作系统
+.vs/
+.vscode/
+.idea/
+*.user
+*.swp
+*~
+.DS_Store
+
+# 日志与测试结果
+*.log
+*.log.*
+coverage*/

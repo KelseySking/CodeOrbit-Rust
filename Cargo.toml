@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/codeorbit-contracts",
+    "crates/codeorbit-core",
+    "crates/codeorbit-hub",
+    "crates/codeorbit-bridge",
+    "crates/codeorbit-host",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["amiya"]
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+codeorbit-contracts = { path = "crates/codeorbit-contracts" }
+codeorbit-core = { path = "crates/codeorbit-core" }
+codeorbit-hub = { path = "crates/codeorbit-hub" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client
+reqwest = { version = "0.13", features = ["json"] }
+
+# System info
+sysinfo = "0.39"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.10"
+fs2 = "0.4"
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+dirs = "6"
+whoami = "2"
+regex = "1"
