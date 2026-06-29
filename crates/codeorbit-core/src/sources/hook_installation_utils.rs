@@ -109,9 +109,9 @@ pub fn set_bridge_executable_path(path: impl Into<String>) {
 
 fn default_bridge_path() -> &'static str {
     if cfg!(windows) {
-        "CodeOrbit-bridge.exe"
+        "codeorbit-bridge.exe"
     } else {
-        "CodeOrbit-bridge"
+        "codeorbit-bridge"
     }
 }
 
@@ -124,14 +124,15 @@ pub fn get_bridge_executable_path() -> String {
         .unwrap_or_else(|| default_bridge_path().to_string())
 }
 
-/// 获取给定源 key 的 hook 命令（bridge 路径 + --source，含空格时加引号）
+/// 获取给定源 key 的 hook 命令（bridge 路径恒加双引号 + --source）
+///
+/// 与 C# `ConfigInstaller.GetHookCommand` 对齐：bridge 路径始终用双引号包裹，
+/// 避免 `/usr/bin/bash` 在未加引号时把 Windows 路径里的反斜杠当作转义符吞掉
+/// （曾导致 `D:\...\codeorbit-bridge.exe` 被解析成 `D:OtherWork...exe` 而报
+/// `command not found`）。
 pub fn get_hook_command(source_key: &str) -> String {
     let bridge = get_bridge_executable_path();
-    if bridge.contains(' ') {
-        format!("\"{bridge}\" --source {source_key}")
-    } else {
-        format!("{bridge} --source {source_key}")
-    }
+    format!("\"{bridge}\" --source {source_key}")
 }
 
 /// 合并两个 JSON 对象，冲突时以 target 为准
@@ -159,6 +160,17 @@ mod tests {
     #[test]
     fn hook_command_includes_source() {
         let cmd = get_hook_command("claude");
+        assert!(cmd.contains("--source claude"));
+    }
+
+    #[test]
+    fn hook_command_always_quotes_bridge_path() {
+        // 对齐 C# ConfigInstaller.GetHookCommand：bridge 路径恒加双引号，
+        // 避免 /usr/bin/bash 在未加引号时吞掉 Windows 路径反斜杠
+        // （曾导致 D:\...\codeorbit-bridge.exe → D:OtherWork...exe 而报 command not found）。
+        // 不设 override，走 default_bridge_path（无空格），仍必须带引号。
+        let cmd = get_hook_command("claude");
+        assert!(cmd.starts_with('"'), "bridge 路径必须恒加双引号: {cmd}");
         assert!(cmd.contains("--source claude"));
     }
 

@@ -29,11 +29,12 @@ pub trait HookInstallationStrategy {
     fn is_installed(&self, source_key: &str, spec: &HookInstallationSpec) -> bool;
 }
 
-/// 判断某命令字符串是否为 CodeOrbit hook 命令
+/// 判断某命令字符串是否为 CodeOrbit hook 命令（大小写不敏感，对齐 C# OrdinalIgnoreCase）
 pub(crate) fn is_codeorbit_hook_command(command: &str, source_key: &str) -> bool {
-    command.contains("CodeOrbit.Bridge")
-        || command.contains("CodeOrbit-bridge")
-        || command.contains(&format!("--source {source_key}"))
+    let lc = command.to_lowercase();
+    lc.contains("codeorbit.bridge")
+        || lc.contains("codeorbit-bridge")
+        || lc.contains(&format!("--source {source_key}").to_lowercase())
 }
 
 /// flat / nested 共享的 TOML extra_config 安装：在指定 section 下追加 key = value
