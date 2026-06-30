@@ -61,16 +61,12 @@ where
 }
 
 #[tokio::test]
-async fn ws_sends_welcome_and_broadcasts_events() {
+async fn ws_broadcasts_events_without_welcome_frame() {
     let (addr, state) = spawn_server().await;
 
     let url = format!("ws://{addr}/api/events?token={TOKEN}");
     let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
-
-    // 欢迎消息（同时作为"已订阅"同步点）
-    let welcome = next_json(&mut ws).await;
-    assert_eq!(welcome["type"], "connection.established");
-    assert!(welcome["data"]["clientId"].is_string());
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 触发状态变更
     state.write().await.handle_event(&session_start("s1"));
@@ -91,10 +87,7 @@ async fn ws_multi_client_broadcast() {
 
     let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
     let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-
-    // 各自欢迎消息（同时确保两端已订阅）
-    assert_eq!(next_json(&mut a).await["type"], "connection.established");
-    assert_eq!(next_json(&mut b).await["type"], "connection.established");
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     state.write().await.handle_event(&session_start("multi"));
 

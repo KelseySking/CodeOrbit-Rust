@@ -44,9 +44,13 @@ fn setup() {
     });
 }
 
-fn build() -> axum::Router {
+fn build_with_state() -> (axum::Router, Arc<RwLock<HubState>>) {
     let state = Arc::new(RwLock::new(HubState::new()));
-    router(AppState::new(state, TOKEN, true))
+    (router(AppState::new(state.clone(), TOKEN, true)), state)
+}
+
+fn build() -> axum::Router {
+    build_with_state().0
 }
 
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
@@ -123,6 +127,27 @@ async fn unknown_source_install_returns_400() {
             .unwrap()
             .contains("Unsupported source")
     );
+}
+
+#[tokio::test]
+async fn source_operation_broadcasts_operation_result() {
+    setup();
+    let (app, state) = build_with_state();
+    let mut rx = state.read().await.subscribe();
+
+    let (status, body) = post(&app, "/api/sources/definitely-not-real/install").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["success"], false);
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.event_type, "source.statusChanged");
+    let data = event.data.unwrap();
+    assert!(data.is_object());
+    assert_eq!(data["source"], "definitely-not-real");
+    assert_eq!(data["success"], false);
 }
 
 #[tokio::test]

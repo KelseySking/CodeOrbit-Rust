@@ -8,10 +8,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
-use chrono::Utc;
-use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
-use uuid::Uuid;
 
 use codeorbit_contracts::HubEventDto;
 
@@ -27,17 +24,6 @@ pub async fn events_handler(State(app): State<AppState>, ws: WebSocketUpgrade) -
 
 async fn handle_socket(mut socket: WebSocket, app: AppState) {
     let mut rx = app.state.read().await.subscribe();
-
-    // 欢迎消息：告知分配的 clientId，并作为"连接就绪/已订阅"的即时确认信号
-    // （这是对 C# 的增强，不改变后续 5 类真实事件流，按类型过滤的消费者会忽略它）
-    let welcome = HubEventDto {
-        event_type: "connection.established".to_string(),
-        timestamp_utc: Utc::now(),
-        data: Some(json!({ "clientId": Uuid::new_v4().to_string() })),
-    };
-    if send_event(&mut socket, &welcome).await.is_err() {
-        return;
-    }
 
     loop {
         tokio::select! {

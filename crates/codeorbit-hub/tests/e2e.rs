@@ -115,7 +115,7 @@ async fn full_pipeline_e2e() {
     // ---- WebSocket 连接 ----
     let url = format!("ws://{addr}/api/events?token={TOKEN}");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-    assert_eq!(next_json(&mut ws).await["type"], "connection.established");
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // ---- 非阻塞事件：SessionStart 经 IPC → ack {} ----
     let ack = ipc_send(&event_json("SessionStart", "e2e", None), false).await;

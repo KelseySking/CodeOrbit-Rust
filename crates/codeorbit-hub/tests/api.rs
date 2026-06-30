@@ -127,6 +127,12 @@ async fn sessions_listed_and_dismissed() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_array().unwrap().len(), 1);
     assert_eq!(body[0]["sessionId"], "s1");
+    assert!(
+        body[0].get("projectName").is_some(),
+        "nullable fields should serialize as null for C# API compatibility"
+    );
+    assert!(body[0]["projectName"].is_null());
+    assert!(body[0].get("lastAssistantMessage").is_some());
 
     let (status, body) = send(&app, "GET", "/api/sessions/s1", Some(TOKEN), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -138,6 +144,22 @@ async fn sessions_listed_and_dismissed() {
 
     let (status, _) = send(&app, "GET", "/api/sessions/s1", Some(TOKEN), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn session_metadata_returns_project_name_from_cwd() {
+    let (app, state) = build();
+    let mut evt = session_start("s1");
+    evt.raw_json = json!({
+        "hook_event_name": "SessionStart",
+        "cwd": "D:\\OtherWork\\CodeOrbit"
+    });
+    state.write().await.handle_event(&evt);
+
+    let (status, body) = send(&app, "GET", "/api/sessions", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body[0]["workingDirectory"], "D:\\OtherWork\\CodeOrbit");
+    assert_eq!(body[0]["projectName"], "CodeOrbit");
 }
 
 #[tokio::test]

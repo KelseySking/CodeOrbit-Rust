@@ -17,6 +17,16 @@ async fn publish_sources(app: &AppState) {
     app.state.read().await.publish("source.statusChanged", data);
 }
 
+async fn publish_source_operation(
+    app: &AppState,
+    result: &codeorbit_contracts::SourceOperationResultDto,
+) {
+    app.state
+        .read()
+        .await
+        .publish("source.statusChanged", serde_json::to_value(result).ok());
+}
+
 /// GET /api/sources
 pub async fn list_sources(State(_app): State<AppState>) -> Json<Vec<SourceDto>> {
     Json(source_service::get_sources())
@@ -33,7 +43,7 @@ pub async fn get_source_status(
 /// POST /api/sources/:source/install
 pub async fn install(State(app): State<AppState>, Path(source): Path<String>) -> impl IntoResponse {
     let result = source_service::install(&source);
-    publish_sources(&app).await;
+    publish_source_operation(&app, &result).await;
     let status = if result.success {
         StatusCode::OK
     } else {
@@ -48,7 +58,7 @@ pub async fn uninstall(
     Path(source): Path<String>,
 ) -> impl IntoResponse {
     let result = source_service::uninstall(&source);
-    publish_sources(&app).await;
+    publish_source_operation(&app, &result).await;
     let status = if result.success {
         StatusCode::OK
     } else {
@@ -60,7 +70,7 @@ pub async fn uninstall(
 /// POST /api/sources/:source/repair
 pub async fn repair(State(app): State<AppState>, Path(source): Path<String>) -> impl IntoResponse {
     let result = source_service::repair(&source);
-    publish_sources(&app).await;
+    publish_source_operation(&app, &result).await;
     let status = if result.success {
         StatusCode::OK
     } else {

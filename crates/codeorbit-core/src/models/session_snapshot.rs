@@ -5,6 +5,10 @@ use crate::models::{
     AgentStatus, ChatMessage, HookEvent, PermissionRequest, QuestionData, SideEffect,
     SupportedSource, ToolHistoryEntry,
 };
+use crate::services::transcript_path_resolver::{
+    extract_project_name, extract_transcript_path, extract_working_directory,
+    try_resolve_codex_transcript_path,
+};
 
 /// 单个 AI 工具会话的快照状态
 ///
@@ -282,6 +286,42 @@ impl SessionSnapshot {
         } else if let Some(parent_pid) = evt.parent_pid {
             state.pid = parent_pid;
             state.tracked_process_started_at_utc = None;
+        }
+
+        let transcript_path = extract_transcript_path(Some(&evt.raw_json))
+            .or_else(|| extract_transcript_path(evt.tool_input.as_ref()));
+        if let Some(path) = transcript_path.filter(|p| !p.trim().is_empty()) {
+            state.transcript_path = Some(path);
+        } else if state.transcript_path.as_deref().is_none_or(str::is_empty)
+            && state.source.eq_ignore_ascii_case("codex")
+            && !state.session_id.trim().is_empty()
+            && let Some(path) = try_resolve_codex_transcript_path(Some(&state.session_id))
+                .filter(|p| !p.trim().is_empty())
+        {
+            state.transcript_path = Some(path);
+        }
+
+        let working_directory = extract_working_directory(Some(&evt.raw_json))
+            .or_else(|| extract_working_directory(evt.tool_input.as_ref()));
+        if let Some(dir) = working_directory.filter(|d| !d.trim().is_empty()) {
+            state.project_name =
+                extract_project_name(Some(&dir)).or_else(|| state.project_name.clone());
+            state.working_directory = Some(dir);
+        }
+
+        if let Some(project) = get_string_field(
+            &evt.raw_json,
+            &[
+                "project_name",
+                "projectName",
+                "project",
+                "workspace_name",
+                "workspaceName",
+            ],
+        )
+        .filter(|p| !p.trim().is_empty())
+        {
+            state.project_name = Some(project);
         }
 
         state
@@ -704,5 +744,42 @@ mod tests {
         assert_eq!(state.status, AgentStatus::Idle);
         assert_eq!(state.last_assistant_message, Some("Done!".to_string()));
         assert!(matches!(effect, SideEffect::PlaySound { .. }));
+    }
+
+    #[test]
+    fn test_metadata_extracts_working_directory_and_project() {
+        let evt = HookEvent::from_json(
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "s1",
+                "cwd": "D:\\OtherWork\\CodeOrbit"
+            }),
+            Some("claude"),
+        )
+        .unwrap();
+
+        let (state, _) = SessionSnapshot::reduce_event(None, &evt);
+        assert_eq!(
+            state.working_directory.as_deref(),
+            Some("D:\\OtherWork\\CodeOrbit")
+        );
+        assert_eq!(state.project_name.as_deref(), Some("CodeOrbit"));
+    }
+
+    #[test]
+    fn test_explicit_project_name_wins() {
+        let evt = HookEvent::from_json(
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "s1",
+                "cwd": "D:\\OtherWork\\CodeOrbit",
+                "project_name": "Explicit"
+            }),
+            Some("claude"),
+        )
+        .unwrap();
+
+        let (state, _) = SessionSnapshot::reduce_event(None, &evt);
+        assert_eq!(state.project_name.as_deref(), Some("Explicit"));
     }
 }
