@@ -58,6 +58,18 @@ pub fn inject_into_payload(payload: &mut Map<String, Value>, env: &[(String, Str
             payload.insert("WT_SESSION".to_string(), Value::String(value.clone()));
         }
     }
+
+    if !payload.contains_key("_term_app") && is_vscode_terminal(env) {
+        payload.insert("_term_app".to_string(), Value::String("vscode".to_string()));
+    }
+}
+
+fn is_vscode_terminal(env: &[(String, String)]) -> bool {
+    env.iter().any(|(key, value)| {
+        (key == "TERM_PROGRAM" && value.eq_ignore_ascii_case("vscode"))
+            || key == "VSCODE_INJECTION"
+            || key == "VSCODE_GIT_IPC_HANDLE"
+    })
 }
 
 #[cfg(windows)]
@@ -95,6 +107,7 @@ mod tests {
 
         assert_eq!(payload["_wt_session"], "guid-123");
         assert_eq!(payload["_term_program"], "vscode");
+        assert_eq!(payload["_term_app"], "vscode");
         // 已有 _ 前缀者不重复加
         assert_eq!(payload["_cwd"], "/home");
         // WT_SESSION 保留原始大写键
@@ -113,5 +126,18 @@ mod tests {
         );
         assert_eq!(payload["WT_SESSION"], "original");
         assert_eq!(payload["_wt_session"], "new");
+    }
+
+    #[test]
+    fn does_not_override_existing_term_app() {
+        let mut payload: Map<String, Value> = json!({ "_term_app": "custom" })
+            .as_object()
+            .unwrap()
+            .clone();
+        inject_into_payload(
+            &mut payload,
+            &[("TERM_PROGRAM".to_string(), "vscode".to_string())],
+        );
+        assert_eq!(payload["_term_app"], "custom");
     }
 }

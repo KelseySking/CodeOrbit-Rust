@@ -2,13 +2,13 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::process_ancestry::{ProcessInfo, process_stem};
+use crate::process_ancestry::{process_stem, ProcessInfo};
 
 /// 被跟踪进程
 #[derive(Debug, Clone)]
 pub struct TrackedProcess {
     pub pid: u32,
-    pub kind: &'static str, // "cli" | "shell" | "parent"
+    pub kind: &'static str, // "cli" | "shell" | "host" | "parent"
     pub started_at_utc: Option<DateTime<Utc>>,
 }
 
@@ -37,6 +37,26 @@ pub fn resolve(
     parent_pid: u32,
     terminal_env: &[(String, String)],
 ) -> TrackedProcess {
+    if is_vscode_terminal(terminal_env)
+        && let Some(shell) = find_shell_process(ancestry)
+    {
+        return TrackedProcess {
+            pid: shell.pid,
+            kind: "shell",
+            started_at_utc: shell.started_at_utc,
+        };
+    }
+
+    if is_vscode_terminal(terminal_env)
+        && let Some(host) = find_vscode_host_process(ancestry)
+    {
+        return TrackedProcess {
+            pid: host.pid,
+            kind: "host",
+            started_at_utc: host.started_at_utc,
+        };
+    }
+
     // JetBrains 偏好：优先 CLI
     if should_prefer_cli_lifecycle(ancestry, terminal_env)
         && let Some(cli) = find_tool_process(ancestry)
@@ -81,6 +101,18 @@ fn find_tool_process(ancestry: &[ProcessInfo]) -> Option<&ProcessInfo> {
     ancestry.iter().find(|p| is_tool_process(p))
 }
 
+fn find_vscode_host_process(ancestry: &[ProcessInfo]) -> Option<&ProcessInfo> {
+    ancestry.iter().find(|p| is_vscode_host_process(p))
+}
+
+fn is_vscode_terminal(terminal_env: &[(String, String)]) -> bool {
+    terminal_env.iter().any(|(key, value)| {
+        (key == "TERM_PROGRAM" && value.eq_ignore_ascii_case("vscode"))
+            || key == "VSCODE_INJECTION"
+            || key == "VSCODE_GIT_IPC_HANDLE"
+    })
+}
+
 fn should_prefer_cli_lifecycle(
     ancestry: &[ProcessInfo],
     terminal_env: &[(String, String)],
@@ -109,6 +141,11 @@ fn is_jetbrains_ide_process(process: &ProcessInfo) -> bool {
 fn is_shell_process(process: &ProcessInfo) -> bool {
     let name = process_stem(&process.name).to_lowercase();
     SHELL_NAMES.contains(&name.as_str())
+}
+
+fn is_vscode_host_process(process: &ProcessInfo) -> bool {
+    let name = process_stem(&process.name).to_lowercase();
+    matches!(name.as_str(), "code" | "code - insiders" | "vscodium")
 }
 
 fn is_tool_process(process: &ProcessInfo) -> bool {
@@ -192,5 +229,38 @@ mod tests {
         let tracked = resolve(&ancestry, 99, &env);
         assert_eq!(tracked.kind, "cli");
         assert_eq!(tracked.pid, 10);
+    }
+
+    #[test]
+    fn vscode_terminal_prefers_shell() {
+        let ancestry = vec![
+            proc(10, "claude", "/usr/bin/claude"),
+            proc(20, "pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe"),
+            proc(
+                30,
+                "Code.exe",
+                "C:/Users/test/AppData/Local/Programs/Microsoft VS Code/Code.exe",
+            ),
+        ];
+        let env = vec![("TERM_PROGRAM".to_string(), "vscode".to_string())];
+        let tracked = resolve(&ancestry, 10, &env);
+        assert_eq!(tracked.kind, "shell");
+        assert_eq!(tracked.pid, 20);
+    }
+
+    #[test]
+    fn vscode_terminal_uses_host_when_shell_missing() {
+        let ancestry = vec![
+            proc(10, "claude", "/usr/bin/claude"),
+            proc(
+                30,
+                "Code.exe",
+                "C:/Users/test/AppData/Local/Programs/Microsoft VS Code/Code.exe",
+            ),
+        ];
+        let env = vec![("VSCODE_INJECTION".to_string(), "1".to_string())];
+        let tracked = resolve(&ancestry, 10, &env);
+        assert_eq!(tracked.kind, "host");
+        assert_eq!(tracked.pid, 30);
     }
 }

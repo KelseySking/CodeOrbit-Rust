@@ -5,7 +5,7 @@ use serde_json::Value;
 use codeorbit_core::models::SupportedSource;
 use codeorbit_core::sources::{PluginProcessDetector, SourcePluginLoader};
 
-use crate::process_ancestry::{ProcessInfo, process_stem};
+use crate::process_ancestry::{process_stem, ProcessInfo};
 
 /// 可执行文件名（去扩展名）→ 来源映射
 fn exe_to_source(name: &str) -> Option<&'static str> {
@@ -14,7 +14,6 @@ fn exe_to_source(name: &str) -> Option<&'static str> {
         "codex" => Some("codex"),
         "gemini" => Some("gemini"),
         "cursor" => Some("cursor"),
-        "code" => Some("vscode"),
         "copilot" => Some("copilot"),
         "qoder" => Some("qoder"),
         "factory" => Some("droid"),
@@ -165,6 +164,15 @@ mod tests {
     fn cursor_agent_promoted() {
         let ancestry = vec![proc("cursor-agent", "/usr/bin/cursor-agent")];
         assert_eq!(infer_source(&ancestry, None, &json!({})), "cursor-cli");
+    }
+
+    #[test]
+    fn vscode_host_is_not_an_ai_source() {
+        let ancestry = vec![proc(
+            "Code.exe",
+            "C:/Program Files/Microsoft VS Code/Code.exe",
+        )];
+        assert_eq!(infer_source(&ancestry, None, &json!({})), "unknown");
     }
 
     #[test]

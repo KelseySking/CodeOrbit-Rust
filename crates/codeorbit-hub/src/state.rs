@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
-use tokio::sync::{RwLock, broadcast, oneshot};
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, oneshot, RwLock};
 
 use codeorbit_contracts::{
     ChatMessageDto, HubEventDto, PendingActionDto, PendingResolutionDto, PermissionRequestDto,
@@ -618,7 +618,10 @@ impl HubState {
             .as_ref()
             .and_then(|id| self.sessions.get(id))
             .cloned();
-        let (new_state, reduced) = SessionSnapshot::reduce_event(existing.clone(), evt);
+        let (mut new_state, reduced) = SessionSnapshot::reduce_event(existing.clone(), evt);
+        if let Some(resolved) = &resolved {
+            new_state.session_id = resolved.clone();
+        }
         let new_state = apply_transcript_messages(existing.as_ref(), new_state);
 
         let session_id = new_state.session_id.clone();
@@ -647,15 +650,21 @@ impl HubState {
         {
             return Some(sid.clone());
         }
-        if self.sessions.len() == 1 {
-            return self.sessions.keys().next().cloned();
-        }
         if let Some(pid) = evt.tracked_pid {
-            let matches: Vec<&SessionSnapshot> =
-                self.sessions.values().filter(|s| s.pid == pid).collect();
+            let matches: Vec<&SessionSnapshot> = self
+                .sessions
+                .values()
+                .filter(|s| same_tracked_process(s, pid, evt.tracked_process_started_at_utc))
+                .collect();
             if matches.len() == 1 {
                 return Some(matches[0].session_id.clone());
             }
+        }
+        if let Some(sid) = synthetic_session_id(evt) {
+            return Some(sid);
+        }
+        if self.sessions.len() == 1 {
+            return self.sessions.keys().next().cloned();
         }
         None
     }
@@ -977,6 +986,34 @@ fn session_source_key(session: Option<&SessionSnapshot>) -> String {
     }
 }
 
+fn same_tracked_process(
+    session: &SessionSnapshot,
+    pid: u32,
+    started_at: Option<DateTime<Utc>>,
+) -> bool {
+    if session.pid != pid {
+        return false;
+    }
+    match (session.tracked_process_started_at_utc, started_at) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+fn synthetic_session_id(evt: &HookEvent) -> Option<String> {
+    let pid = evt.tracked_pid?;
+    let source = evt
+        .source
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("unknown");
+    let started = evt
+        .tracked_process_started_at_utc
+        .map(|dt| dt.timestamp().to_string())
+        .unwrap_or_else(|| "unknown-start".to_string());
+    Some(format!("process-{source}-{pid}-{started}"))
+}
+
 fn session_project_name(session: Option<&SessionSnapshot>) -> String {
     let Some(s) = session else {
         return "unknown".to_string();
@@ -1151,6 +1188,23 @@ mod tests {
         }
     }
 
+    fn session_start_without_id(pid: u32, started_at: &str) -> HookEvent {
+        HookEvent {
+            event_name: "SessionStart".to_string(),
+            session_id: None,
+            tool_name: None,
+            tool_use_id: None,
+            agent_id: None,
+            tool_input: None,
+            raw_json: json!({ "hook_event_name": "SessionStart" }),
+            source: Some("claude".to_string()),
+            parent_pid: None,
+            tracked_pid: Some(pid),
+            tracked_pid_kind: Some("shell".to_string()),
+            tracked_process_started_at_utc: Some(started_at.parse::<DateTime<Utc>>().unwrap()),
+        }
+    }
+
     fn pending_action_id(outcome: &BlockingOutcome) -> String {
         match outcome {
             BlockingOutcome::Pending(h) => h.action_id.clone(),
@@ -1164,6 +1218,29 @@ mod tests {
         state.handle_event(&session_start("s1"));
         assert_eq!(state.get_sessions().len(), 1);
         assert_eq!(state.get_session("s1").unwrap().session_id, "s1");
+    }
+
+    #[test]
+    fn missing_session_id_uses_stable_process_key() {
+        let mut state = HubState::new();
+        let event = session_start_without_id(42, "2026-07-03T00:00:00Z");
+
+        state.handle_event(&event);
+        state.handle_event(&event);
+
+        let sessions = state.get_sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "process-claude-42-1783036800");
+    }
+
+    #[test]
+    fn process_key_distinguishes_reused_pid_start_time() {
+        let mut state = HubState::new();
+
+        state.handle_event(&session_start_without_id(42, "2026-07-03T00:00:00Z"));
+        state.handle_event(&session_start_without_id(42, "2026-07-03T00:01:00Z"));
+
+        assert_eq!(state.get_sessions().len(), 2);
     }
 
     #[test]
