@@ -88,9 +88,14 @@ If you are building a desktop app, web UI, browser extension, IDE plugin, mobile
 | `GET` | `/api/sources` | List supported CLI sources and install status. |
 | `GET` | `/api/sources/{source}` | Get source status. |
 | `GET` | `/api/sources/{source}/status` | Source status alias. |
+| `GET` | `/api/sources/wsl/distros` | List installed WSL distributions. |
+| `GET` | `/api/sources/{source}/wsl/status?distro=<name>` | Get source hook status inside a WSL distribution. |
 | `POST` | `/api/sources/{source}/install` | Install or update the CodeOrbit hook for one source. |
 | `POST` | `/api/sources/{source}/uninstall` | Remove CodeOrbit-owned hook entries. |
 | `POST` | `/api/sources/{source}/repair` | Repair one source hook configuration. |
+| `POST` | `/api/sources/{source}/wsl/install?distro=<name>` | Install a source hook inside WSL that calls the Windows bridge. |
+| `POST` | `/api/sources/{source}/wsl/uninstall?distro=<name>` | Remove CodeOrbit-owned hook entries inside WSL. |
+| `POST` | `/api/sources/{source}/wsl/repair?distro=<name>` | Repair one WSL source hook configuration. |
 | `POST` | `/api/sources/repair-all` | Repair every installed source. |
 | `GET` | `/api/runtime-assets` | Get Runtime hook script and bridge paths. |
 | `POST` | `/api/runtime-assets/repair` | Repair shared Runtime assets. |
@@ -208,6 +213,20 @@ Returns `SourceDto[]`:
 ```
 
 Failures usually return `400` with `success=false`.
+
+### WSL source operations
+
+`GET /api/sources/wsl/distros` returns installed WSL distributions:
+
+```json
+{
+  "distros": ["Ubuntu"]
+}
+```
+
+`GET /api/sources/{source}/wsl/status?distro=Ubuntu` returns `SourceStatusDto`.
+
+`POST /api/sources/{source}/wsl/install`, `/uninstall`, and `/repair` take an optional `distro` query. If omitted, Runtime uses the default WSL distro. WSL hooks call the Windows `codeorbit-bridge.exe` through WSL interop with explicit `--source <source>`.
 
 ### Runtime assets
 

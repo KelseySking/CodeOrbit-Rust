@@ -7,6 +7,7 @@ use codeorbit_core::sources::SourcePluginLoader;
 use codeorbit_core::sources::adapter_trait::SourceAdapter;
 
 use crate::config_installer;
+use crate::wsl_installer;
 
 /// 默认能力（所有插件源均支持全部能力）
 fn default_capabilities() -> SourceCapabilitiesDto {
@@ -89,6 +90,61 @@ pub fn repair(source: &str) -> SourceOperationResultDto {
     run_source_operation(source, "repaired", config_installer::install_plugin)
 }
 
+pub fn list_wsl_distros() -> Result<Vec<String>, String> {
+    wsl_installer::list_distros()
+}
+
+pub fn get_wsl_source_status(source: &str, distro: Option<&str>) -> SourceStatusDto {
+    let normalized = normalize_source(source);
+    let loader = SourcePluginLoader::new();
+    let plugins = loader.load_plugins();
+    let plugin = plugins
+        .iter()
+        .find(|p| p.source_key().eq_ignore_ascii_case(&normalized));
+
+    match plugin {
+        None => SourceStatusDto {
+            source: normalized.clone(),
+            supported: false,
+            installed: false,
+            display_name: normalized,
+        },
+        Some(p) => SourceStatusDto {
+            source: normalized.clone(),
+            supported: true,
+            installed: wsl_installer::is_plugin_installed(&normalized, distro).unwrap_or(false),
+            display_name: p.display_name().to_string(),
+        },
+    }
+}
+
+pub fn install_wsl(source: &str, distro: Option<&str>) -> SourceOperationResultDto {
+    run_wsl_source_operation(
+        source,
+        "installed in WSL",
+        distro,
+        wsl_installer::install_plugin,
+    )
+}
+
+pub fn uninstall_wsl(source: &str, distro: Option<&str>) -> SourceOperationResultDto {
+    run_wsl_source_operation(
+        source,
+        "uninstalled from WSL",
+        distro,
+        wsl_installer::uninstall_plugin,
+    )
+}
+
+pub fn repair_wsl(source: &str, distro: Option<&str>) -> SourceOperationResultDto {
+    run_wsl_source_operation(
+        source,
+        "repaired in WSL",
+        distro,
+        wsl_installer::install_plugin,
+    )
+}
+
 /// 修复所有已安装的数据源
 pub fn repair_all() -> bool {
     let loader = SourcePluginLoader::new();
@@ -153,6 +209,48 @@ fn run_source_operation(
         success,
         installed: config_installer::is_plugin_installed(&normalized),
         message,
+    }
+}
+
+fn run_wsl_source_operation(
+    source: &str,
+    success_verb: &str,
+    distro: Option<&str>,
+    operation: impl Fn(&str, Option<&str>) -> Result<bool, String>,
+) -> SourceOperationResultDto {
+    let normalized = normalize_source(source);
+    let loader = SourcePluginLoader::new();
+    let plugins = loader.load_plugins();
+    let exists = plugins
+        .iter()
+        .any(|p| p.source_key().eq_ignore_ascii_case(&normalized));
+
+    if !exists {
+        return SourceOperationResultDto {
+            source: normalized,
+            success: false,
+            installed: false,
+            message: format!("Unsupported source: {source}"),
+        };
+    }
+
+    match operation(&normalized, distro) {
+        Ok(success) => SourceOperationResultDto {
+            source: normalized.clone(),
+            success,
+            installed: wsl_installer::is_plugin_installed(&normalized, distro).unwrap_or(false),
+            message: if success {
+                format!("{normalized} {success_verb}")
+            } else {
+                format!("{normalized} WSL operation failed")
+            },
+        },
+        Err(message) => SourceOperationResultDto {
+            source: normalized,
+            success: false,
+            installed: false,
+            message,
+        },
     }
 }
 

@@ -89,9 +89,14 @@ codeorbit-host.exe --host 0.0.0.0 --port 32145 --token <token>
 | `GET` | `/api/sources` | 列出支持的 CLI source 和安装状态。 |
 | `GET` | `/api/sources/{source}` | 获取 source 状态。 |
 | `GET` | `/api/sources/{source}/status` | source 状态别名。 |
+| `GET` | `/api/sources/wsl/distros` | 列出已安装的 WSL 发行版。 |
+| `GET` | `/api/sources/{source}/wsl/status?distro=<name>` | 获取某个 WSL 发行版内的 source hook 状态。 |
 | `POST` | `/api/sources/{source}/install` | 安装或更新某个 source 的 CodeOrbit hook。 |
 | `POST` | `/api/sources/{source}/uninstall` | 卸载 CodeOrbit 自己拥有的 hook entry。 |
 | `POST` | `/api/sources/{source}/repair` | 修复某个 source 的 hook 配置。 |
+| `POST` | `/api/sources/{source}/wsl/install?distro=<name>` | 在 WSL 内安装调用 Windows bridge 的 source hook。 |
+| `POST` | `/api/sources/{source}/wsl/uninstall?distro=<name>` | 卸载 WSL 内 CodeOrbit 自己拥有的 hook entry。 |
+| `POST` | `/api/sources/{source}/wsl/repair?distro=<name>` | 修复某个 WSL source hook 配置。 |
 | `POST` | `/api/sources/repair-all` | 修复所有已安装 source。 |
 | `GET` | `/api/runtime-assets` | 获取 Runtime hook script 和 bridge 路径。 |
 | `POST` | `/api/runtime-assets/repair` | 修复共享 Runtime 资产。 |
@@ -230,6 +235,20 @@ POST /api/sources/codex/repair
 ```
 
 失败时通常返回 `400`，响应体仍是 `SourceOperationResultDto`，`success=false`。
+
+### WSL source 操作
+
+`GET /api/sources/wsl/distros` 返回已安装的 WSL 发行版：
+
+```json
+{
+  "distros": ["Ubuntu"]
+}
+```
+
+`GET /api/sources/{source}/wsl/status?distro=Ubuntu` 返回 `SourceStatusDto`。
+
+`POST /api/sources/{source}/wsl/install`、`/uninstall` 和 `/repair` 支持可选 `distro` query。未指定时 Runtime 使用默认 WSL 发行版。WSL hook 会通过 WSL interop 调用 Windows `codeorbit-bridge.exe`，并显式传入 `--source <source>`。
 
 ### `POST /api/sources/repair-all`
 

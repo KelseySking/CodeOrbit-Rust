@@ -76,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         // 数据源管理
         .route("/api/sources", get(sources::list_sources))
         .route("/api/sources/repair-all", post(sources::repair_all))
+        .route("/api/sources/wsl/distros", get(sources::list_wsl_distros))
         .route("/api/sources/{source}", get(sources::get_source_status))
         .route(
             "/api/sources/{source}/status",
@@ -84,6 +85,22 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{source}/install", post(sources::install))
         .route("/api/sources/{source}/uninstall", post(sources::uninstall))
         .route("/api/sources/{source}/repair", post(sources::repair))
+        .route(
+            "/api/sources/{source}/wsl/status",
+            get(sources::get_wsl_source_status),
+        )
+        .route(
+            "/api/sources/{source}/wsl/install",
+            post(sources::install_wsl),
+        )
+        .route(
+            "/api/sources/{source}/wsl/uninstall",
+            post(sources::uninstall_wsl),
+        )
+        .route(
+            "/api/sources/{source}/wsl/repair",
+            post(sources::repair_wsl),
+        )
         // 运行时资源
         .route(
             "/api/runtime-assets",

@@ -130,6 +130,21 @@ async fn unknown_source_install_returns_400() {
 }
 
 #[tokio::test]
+async fn unknown_source_wsl_install_returns_400() {
+    setup();
+    let app = build();
+    let (status, body) = post(&app, "/api/sources/definitely-not-real/wsl/install").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["success"], false);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported source")
+    );
+}
+
+#[tokio::test]
 async fn source_operation_broadcasts_operation_result() {
     setup();
     let (app, state) = build_with_state();

@@ -1,0 +1,263 @@
+//! WSL hook installation support for a Windows Runtime.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+use codeorbit_core::sources::adapter_trait::SourceAdapter;
+use codeorbit_core::sources::hook_installation_utils::set_bridge_executable_path;
+use codeorbit_core::sources::plugin_models::HookInstallationSpec;
+use codeorbit_core::sources::{SourcePluginLoader, hook_strategy_factory};
+
+use crate::config_installer;
+
+pub fn list_distros() -> Result<Vec<String>, String> {
+    let output = Command::new("wsl.exe")
+        .args(["--list", "--quiet"])
+        .output()
+        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    if !output.status.success() {
+        return Err(command_error("wsl.exe --list --quiet", &output.stderr));
+    }
+    Ok(parse_distros(&decode_wsl_output(&output.stdout)))
+}
+
+pub fn default_distro() -> Result<String, String> {
+    list_distros()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no WSL distributions found".to_string())
+}
+
+pub fn install_plugin(source_key: &str, distro: Option<&str>) -> Result<bool, String> {
+    run_strategy(source_key, distro, true, |strategy, key, spec| {
+        strategy.install(key, spec)
+    })
+}
+
+pub fn uninstall_plugin(source_key: &str, distro: Option<&str>) -> Result<bool, String> {
+    run_strategy(source_key, distro, false, |strategy, key, spec| {
+        strategy.uninstall(key, spec)
+    })
+}
+
+pub fn is_plugin_installed(source_key: &str, distro: Option<&str>) -> Result<bool, String> {
+    run_strategy(source_key, distro, false, |strategy, key, spec| {
+        strategy.is_installed(key, spec)
+    })
+}
+
+fn run_strategy(
+    source_key: &str,
+    distro: Option<&str>,
+    require_bridge: bool,
+    operation: impl FnOnce(
+        Box<dyn codeorbit_core::sources::strategies::HookInstallationStrategy>,
+        &str,
+        &HookInstallationSpec,
+    ) -> bool,
+) -> Result<bool, String> {
+    let Some(spec) = find_hook_spec(source_key) else {
+        return Err(format!("Unsupported source: {source_key}"));
+    };
+    if require_bridge && !config_installer::runtime_bridge_exe_path().exists() {
+        return Err(format!(
+            "missing bridge executable: {}",
+            config_installer::runtime_bridge_exe_path().display()
+        ));
+    }
+
+    let distro = resolve_distro(distro)?;
+    let home = wsl_home(&distro)?;
+    let home_unc = wsl_home_unc(&distro, &home)?;
+    let spec = spec_for_wsl(&spec, &home_unc);
+    let strategy = hook_strategy_factory::create(&spec.format)
+        .ok_or_else(|| format!("Unsupported hook format: {}", spec.format))?;
+
+    if require_bridge {
+        let bridge = wsl_path(&distro, &config_installer::runtime_bridge_exe_path())?;
+        set_bridge_executable_path(bridge);
+    }
+
+    let result = operation(strategy, source_key, &spec);
+    // ponytail: global bridge override; serialize source install calls if concurrent installs matter.
+    set_bridge_executable_path(config_installer::runtime_bridge_exe_path().to_string_lossy());
+    Ok(result)
+}
+
+fn resolve_distro(distro: Option<&str>) -> Result<String, String> {
+    match distro.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => Ok(d.to_string()),
+        None => default_distro(),
+    }
+}
+
+fn find_hook_spec(source_key: &str) -> Option<HookInstallationSpec> {
+    let loader = SourcePluginLoader::new();
+    loader
+        .load_plugins()
+        .iter()
+        .find(|p| p.source_key().eq_ignore_ascii_case(source_key))
+        .and_then(|p| p.hook_installation_spec().cloned())
+}
+
+fn wsl_home(distro: &str) -> Result<String, String> {
+    let output = Command::new("wsl.exe")
+        .args(["-d", distro, "--", "sh", "-lc", "printf %s \"$HOME\""])
+        .output()
+        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    if !output.status.success() {
+        return Err(command_error("wsl.exe home probe", &output.stderr));
+    }
+    let home = decode_wsl_output(&output.stdout).trim().to_string();
+    if home.is_empty() {
+        Err(format!("could not read WSL home for distro {distro}"))
+    } else {
+        Ok(home)
+    }
+}
+
+fn wsl_path(distro: &str, path: &PathBuf) -> Result<String, String> {
+    let output = Command::new("wsl.exe")
+        .args(["-d", distro, "--", "wslpath", "-a"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    if !output.status.success() {
+        return Err(command_error("wslpath", &output.stderr));
+    }
+    let converted = decode_wsl_output(&output.stdout).trim().to_string();
+    if converted.is_empty() {
+        Err(format!(
+            "could not convert path for WSL: {}",
+            path.display()
+        ))
+    } else {
+        Ok(converted)
+    }
+}
+
+fn command_error(command: &str, stderr: &[u8]) -> String {
+    let detail = decode_wsl_output(stderr).trim().to_string();
+    if detail.is_empty() {
+        format!("{command} failed")
+    } else {
+        format!("{command} failed: {detail}")
+    }
+}
+
+fn spec_for_wsl(spec: &HookInstallationSpec, home_unc: &str) -> HookInstallationSpec {
+    let mut spec = spec.clone();
+    spec.config_path = translate_home_path(&spec.config_path, home_unc);
+    if let Some(extra) = &mut spec.extra_config {
+        extra.file = translate_home_path(&extra.file, home_unc);
+    }
+    spec
+}
+
+fn translate_home_path(path: &str, home_unc: &str) -> String {
+    if let Some(rest) = strip_home_prefix(path) {
+        return join_unc(home_unc, rest);
+    }
+    if let Some(rest) = strip_prefix(path, "%USERPROFILE%") {
+        return join_unc(home_unc, rest);
+    }
+    if let Some(rest) = strip_prefix(path, "%APPDATA%") {
+        return join_unc(&join_unc(home_unc, ".config"), rest);
+    }
+    path.to_string()
+}
+
+fn strip_home_prefix(path: &str) -> Option<&str> {
+    path.strip_prefix("~/")
+        .or_else(|| path.strip_prefix("~\\"))
+        .or_else(|| path.strip_prefix("$HOME/"))
+        .or_else(|| path.strip_prefix("$HOME\\"))
+}
+
+fn strip_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/').or_else(|| rest.strip_prefix('\\')))
+}
+
+fn join_unc(base: &str, rest: &str) -> String {
+    let rest = rest.trim_start_matches(['/', '\\']);
+    if rest.is_empty() {
+        return base.trim_end_matches(['/', '\\']).to_string();
+    }
+    format!(
+        "{}\\{}",
+        base.trim_end_matches(['/', '\\']),
+        rest.replace('/', "\\")
+    )
+}
+
+fn wsl_home_unc(distro: &str, home: &str) -> Result<String, String> {
+    let home = home.trim();
+    if !home.starts_with('/') {
+        return Err(format!("WSL home must be absolute: {home}"));
+    }
+    let relative = home.trim_start_matches('/').replace('/', "\\");
+    if relative.is_empty() {
+        Ok(format!(r"\\wsl.localhost\{distro}"))
+    } else {
+        Ok(format!(r"\\wsl.localhost\{distro}\{relative}"))
+    }
+}
+
+fn parse_distros(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(|line| line.trim().trim_start_matches('\u{feff}').to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn decode_wsl_output(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes.iter().filter(|b| **b == 0).count() > bytes.len() / 4 {
+        let mut units = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes.chunks_exact(2) {
+            units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_utf16_wsl_distro_output() {
+        let raw: Vec<u8> = "Ubuntu\r\ndocker-desktop\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            parse_distros(&decode_wsl_output(&raw)),
+            vec!["Ubuntu".to_string(), "docker-desktop".to_string()]
+        );
+    }
+
+    #[test]
+    fn maps_wsl_home_to_unc() {
+        assert_eq!(
+            wsl_home_unc("Ubuntu", "/home/amiya").unwrap(),
+            r"\\wsl.localhost\Ubuntu\home\amiya"
+        );
+    }
+
+    #[test]
+    fn translates_home_markers_to_wsl_unc() {
+        let home = r"\\wsl.localhost\Ubuntu\home\amiya";
+        assert_eq!(
+            translate_home_path("~/.codex/hooks.json", home),
+            r"\\wsl.localhost\Ubuntu\home\amiya\.codex\hooks.json"
+        );
+        assert_eq!(
+            translate_home_path("%APPDATA%/tool/config.json", home),
+            r"\\wsl.localhost\Ubuntu\home\amiya\.config\tool\config.json"
+        );
+    }
+}

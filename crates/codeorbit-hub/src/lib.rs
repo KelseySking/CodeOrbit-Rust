@@ -6,6 +6,7 @@ pub mod hook_server;
 pub mod process_monitor;
 pub mod source_service;
 pub mod state;
+pub mod wsl_installer;
 
 pub use api::{AppState, router};
 pub use hook_server::HookServer;
