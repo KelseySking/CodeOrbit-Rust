@@ -37,13 +37,11 @@ pub fn resolve(
     parent_pid: u32,
     terminal_env: &[(String, String)],
 ) -> TrackedProcess {
-    if is_vscode_terminal(terminal_env)
-        && let Some(shell) = find_shell_process(ancestry)
-    {
+    if let Some(cli) = find_tool_process(ancestry) {
         return TrackedProcess {
-            pid: shell.pid,
-            kind: "shell",
-            started_at_utc: shell.started_at_utc,
+            pid: cli.pid,
+            kind: "cli",
+            started_at_utc: cli.started_at_utc,
         };
     }
 
@@ -57,17 +55,6 @@ pub fn resolve(
         };
     }
 
-    // JetBrains 偏好：优先 CLI
-    if should_prefer_cli_lifecycle(ancestry, terminal_env)
-        && let Some(cli) = find_tool_process(ancestry)
-    {
-        return TrackedProcess {
-            pid: cli.pid,
-            kind: "cli",
-            started_at_utc: cli.started_at_utc,
-        };
-    }
-
     if let Some(shell) = find_shell_process(ancestry) {
         return TrackedProcess {
             pid: shell.pid,
@@ -75,15 +62,6 @@ pub fn resolve(
             started_at_utc: shell.started_at_utc,
         };
     }
-
-    if let Some(tool) = find_tool_process(ancestry) {
-        return TrackedProcess {
-            pid: tool.pid,
-            kind: "cli",
-            started_at_utc: tool.started_at_utc,
-        };
-    }
-
     // 兜底：直接父进程
     let parent = ancestry.iter().find(|p| p.pid == parent_pid);
     TrackedProcess {
@@ -111,31 +89,6 @@ fn is_vscode_terminal(terminal_env: &[(String, String)]) -> bool {
             || key == "VSCODE_INJECTION"
             || key == "VSCODE_GIT_IPC_HANDLE"
     })
-}
-
-fn should_prefer_cli_lifecycle(
-    ancestry: &[ProcessInfo],
-    terminal_env: &[(String, String)],
-) -> bool {
-    if let Some((_, emulator)) = terminal_env.iter().find(|(k, _)| k == "TERMINAL_EMULATOR") {
-        let lc = emulator.to_lowercase();
-        if lc.contains("jetbrains-jediterm") || lc.contains("jediterm") {
-            return true;
-        }
-    }
-    ancestry.iter().any(is_jetbrains_ide_process)
-}
-
-fn is_jetbrains_ide_process(process: &ProcessInfo) -> bool {
-    let name = process_stem(&process.name).to_lowercase();
-    const IDES: &[&str] = &[
-        "idea", "rider", "webstorm", "pycharm", "clion", "goland", "phpstorm", "rubymine",
-        "datagrip",
-    ];
-    if IDES.iter().any(|ide| name.contains(ide)) {
-        return true;
-    }
-    process.executable_path.to_lowercase().contains("jetbrains")
 }
 
 fn is_shell_process(process: &ProcessInfo) -> bool {
@@ -181,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_preferred_over_parent() {
+    fn shell_used_when_no_tool() {
         let ancestry = vec![proc(10, "git.exe", ""), proc(20, "bash", "/bin/bash")];
         let tracked = resolve(&ancestry, 99, &[]);
         assert_eq!(tracked.pid, 20);
@@ -205,11 +158,10 @@ mod tests {
     }
 
     #[test]
-    fn jetbrains_prefers_cli_over_shell() {
+    fn cli_preferred_over_shell() {
         let ancestry = vec![
             proc(10, "claude", "/usr/bin/claude"),
             proc(20, "bash", "/bin/bash"),
-            proc(30, "idea64.exe", "C:/JetBrains/idea64.exe"),
         ];
         let tracked = resolve(&ancestry, 99, &[]);
         assert_eq!(tracked.kind, "cli");
@@ -217,22 +169,23 @@ mod tests {
     }
 
     #[test]
-    fn jetbrains_env_triggers_cli_preference() {
+    fn cli_preferred_over_hook_shell() {
         let ancestry = vec![
-            proc(10, "claude", "/usr/bin/claude"),
-            proc(20, "bash", "/bin/bash"),
+            proc(10, "cmd.exe", "C:/Windows/System32/cmd.exe"),
+            proc(
+                20,
+                "codex.exe",
+                "C:/Users/test/AppData/Roaming/npm/codex.exe",
+            ),
+            proc(30, "pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe"),
         ];
-        let env = vec![(
-            "TERMINAL_EMULATOR".to_string(),
-            "JetBrains-JediTerm".to_string(),
-        )];
-        let tracked = resolve(&ancestry, 99, &env);
+        let tracked = resolve(&ancestry, 10, &[]);
         assert_eq!(tracked.kind, "cli");
-        assert_eq!(tracked.pid, 10);
+        assert_eq!(tracked.pid, 20);
     }
 
     #[test]
-    fn vscode_terminal_prefers_shell() {
+    fn vscode_terminal_prefers_cli() {
         let ancestry = vec![
             proc(10, "claude", "/usr/bin/claude"),
             proc(20, "pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe"),
@@ -244,20 +197,17 @@ mod tests {
         ];
         let env = vec![("TERM_PROGRAM".to_string(), "vscode".to_string())];
         let tracked = resolve(&ancestry, 10, &env);
-        assert_eq!(tracked.kind, "shell");
-        assert_eq!(tracked.pid, 20);
+        assert_eq!(tracked.kind, "cli");
+        assert_eq!(tracked.pid, 10);
     }
 
     #[test]
-    fn vscode_terminal_uses_host_when_shell_missing() {
-        let ancestry = vec![
-            proc(10, "claude", "/usr/bin/claude"),
-            proc(
-                30,
-                "Code.exe",
-                "C:/Users/test/AppData/Local/Programs/Microsoft VS Code/Code.exe",
-            ),
-        ];
+    fn vscode_terminal_uses_host_when_tool_missing() {
+        let ancestry = vec![proc(
+            30,
+            "Code.exe",
+            "C:/Users/test/AppData/Local/Programs/Microsoft VS Code/Code.exe",
+        )];
         let env = vec![("VSCODE_INJECTION".to_string(), "1".to_string())];
         let tracked = resolve(&ancestry, 10, &env);
         assert_eq!(tracked.kind, "host");
