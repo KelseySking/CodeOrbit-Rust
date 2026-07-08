@@ -5,6 +5,14 @@ All notable changes to CodeOrbit (Rust) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-08
+
+### Added
+- WSL hook installation support for bundled CLI sources.
+
+### Fixed
+- Improved VSCode terminal environment detection and process tracking.
+
 ## [0.1.0] - 2026-06-27
 
 Initial Rust release — a full migration of the CodeOrbit backend from C# to a Rust workspace.
@@ -29,4 +37,5 @@ Initial Rust release — a full migration of the CodeOrbit backend from C# to a 
 - `ClaudeMatcherStrategy` performs surgical install/uninstall that preserves the user's
   own non-CodeOrbit Claude hooks.
 
+[0.1.1]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.1
 [0.1.0]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.0
