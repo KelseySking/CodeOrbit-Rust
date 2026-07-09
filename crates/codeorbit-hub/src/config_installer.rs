@@ -4,11 +4,20 @@
 //! 并通过 `set_bridge_executable_path` 将运行时 bridge 路径注入到生成的 hook 命令。
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use codeorbit_core::sources::hook_installation_utils::set_bridge_executable_path;
 use codeorbit_core::sources::{SourcePluginLoader, hook_strategy_factory};
 
 const HOOK_SCRIPT_NAME: &str = "CodeOrbit-hook.ps1";
+static HOOK_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn with_hook_install_lock<T>(operation: impl FnOnce() -> T) -> T {
+    let _guard = HOOK_INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    operation()
+}
 
 fn bridge_exe_name() -> &'static str {
     if cfg!(windows) {
@@ -77,12 +86,14 @@ pub fn install_plugin(source_key: &str) -> bool {
     if !runtime_bridge_exe_path().exists() {
         return false;
     }
-    set_bridge_executable_path(runtime_bridge_exe_path().to_string_lossy().into_owned());
 
-    match hook_strategy_factory::create(&spec.format) {
-        Some(strategy) => strategy.install(source_key, &spec),
-        None => false,
-    }
+    with_hook_install_lock(|| {
+        set_bridge_executable_path(runtime_bridge_exe_path().to_string_lossy().into_owned());
+        match hook_strategy_factory::create(&spec.format) {
+            Some(strategy) => strategy.install(source_key, &spec),
+            None => false,
+        }
+    })
 }
 
 /// 卸载指定插件的 hook 配置
@@ -92,10 +103,10 @@ pub fn uninstall_plugin(source_key: &str) -> bool {
         // 但 find_hook_spec 仅在插件存在且有 spec 时返回 Some，故区分见下。
         return !plugin_exists(source_key);
     };
-    match hook_strategy_factory::create(&spec.format) {
+    with_hook_install_lock(|| match hook_strategy_factory::create(&spec.format) {
         Some(strategy) => strategy.uninstall(source_key, &spec),
         None => false,
-    }
+    })
 }
 
 /// 检查插件 hook 是否已安装
@@ -103,10 +114,10 @@ pub fn is_plugin_installed(source_key: &str) -> bool {
     let Some(spec) = find_hook_spec(source_key) else {
         return false;
     };
-    match hook_strategy_factory::create(&spec.format) {
+    with_hook_install_lock(|| match hook_strategy_factory::create(&spec.format) {
         Some(strategy) => strategy.is_installed(source_key, &spec),
         None => false,
-    }
+    })
 }
 
 fn find_hook_spec(

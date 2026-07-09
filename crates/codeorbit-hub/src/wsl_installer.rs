@@ -11,6 +11,7 @@ use codeorbit_core::sources::{SourcePluginLoader, hook_strategy_factory};
 use crate::config_installer;
 
 pub fn list_distros() -> Result<Vec<String>, String> {
+    ensure_windows_runtime()?;
     let output = Command::new("wsl.exe")
         .args(["--list", "--quiet"])
         .output()
@@ -22,6 +23,10 @@ pub fn list_distros() -> Result<Vec<String>, String> {
 }
 
 pub fn default_distro() -> Result<String, String> {
+    ensure_windows_runtime()?;
+    if let Ok(Some(distro)) = default_distro_from_verbose() {
+        return Ok(distro);
+    }
     list_distros()?
         .into_iter()
         .next()
@@ -59,6 +64,7 @@ fn run_strategy(
     let Some(spec) = find_hook_spec(source_key) else {
         return Err(format!("Unsupported source: {source_key}"));
     };
+    ensure_windows_runtime()?;
     if require_bridge && !config_installer::runtime_bridge_exe_path().exists() {
         return Err(format!(
             "missing bridge executable: {}",
@@ -73,15 +79,32 @@ fn run_strategy(
     let strategy = hook_strategy_factory::create(&spec.format)
         .ok_or_else(|| format!("Unsupported hook format: {}", spec.format))?;
 
-    if require_bridge {
-        let bridge = wsl_path(&distro, &config_installer::runtime_bridge_exe_path())?;
-        set_bridge_executable_path(bridge);
-    }
+    let bridge = if require_bridge {
+        Some(wsl_path(
+            &distro,
+            &config_installer::runtime_bridge_exe_path(),
+        )?)
+    } else {
+        None
+    };
 
-    let result = operation(strategy, source_key, &spec);
-    // ponytail: global bridge override; serialize source install calls if concurrent installs matter.
-    set_bridge_executable_path(config_installer::runtime_bridge_exe_path().to_string_lossy());
+    let result = config_installer::with_hook_install_lock(|| {
+        if let Some(bridge) = bridge {
+            set_bridge_executable_path(bridge);
+        }
+        let result = operation(strategy, source_key, &spec);
+        set_bridge_executable_path(config_installer::runtime_bridge_exe_path().to_string_lossy());
+        result
+    });
     Ok(result)
+}
+
+fn ensure_windows_runtime() -> Result<(), String> {
+    if cfg!(windows) {
+        Ok(())
+    } else {
+        Err("WSL operations are only supported on Windows Runtime".to_string())
+    }
 }
 
 fn resolve_distro(distro: Option<&str>) -> Result<String, String> {
@@ -89,6 +112,19 @@ fn resolve_distro(distro: Option<&str>) -> Result<String, String> {
         Some(d) => Ok(d.to_string()),
         None => default_distro(),
     }
+}
+
+fn default_distro_from_verbose() -> Result<Option<String>, String> {
+    let output = Command::new("wsl.exe")
+        .args(["--list", "--verbose"])
+        .output()
+        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    if !output.status.success() {
+        return Err(command_error("wsl.exe --list --verbose", &output.stderr));
+    }
+    Ok(parse_default_distro_from_verbose(&decode_wsl_output(
+        &output.stdout,
+    )))
 }
 
 fn find_hook_spec(source_key: &str) -> Option<HookInstallationSpec> {
@@ -212,6 +248,14 @@ fn parse_distros(output: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_default_distro_from_verbose(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let line = line.trim().trim_start_matches('\u{feff}').trim();
+        let distro = line.strip_prefix('*')?.trim();
+        distro.split_whitespace().next().map(str::to_string)
+    })
+}
+
 fn decode_wsl_output(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes.iter().filter(|b| **b == 0).count() > bytes.len() / 4 {
         let mut units = Vec::with_capacity(bytes.len() / 2);
@@ -238,6 +282,21 @@ mod tests {
             parse_distros(&decode_wsl_output(&raw)),
             vec!["Ubuntu".to_string(), "docker-desktop".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_default_distro_from_verbose_output() {
+        let raw = "  NAME                   STATE           VERSION\r\n* Ubuntu                 Running         2\r\n  Debian                 Stopped         2\r\n";
+        assert_eq!(
+            parse_default_distro_from_verbose(raw),
+            Some("Ubuntu".to_string())
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wsl_operations_are_windows_only() {
+        assert!(list_distros().unwrap_err().contains("Windows Runtime"));
     }
 
     #[test]
