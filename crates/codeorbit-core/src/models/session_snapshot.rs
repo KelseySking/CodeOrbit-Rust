@@ -2,12 +2,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    AgentStatus, ChatMessage, HookEvent, PermissionRequest, QuestionData, SideEffect,
-    SupportedSource, ToolHistoryEntry,
+    AgentStatus, ChatMessage, HookEvent, PermissionRequest, QuestionData, QuestionItem,
+    QuestionOption, SideEffect, SupportedSource, ToolHistoryEntry,
 };
-use crate::services::transcript_path_resolver::{
-    extract_project_name, extract_transcript_path, extract_working_directory,
-    try_resolve_codex_transcript_path,
+use crate::services::{
+    hook_tool_classifier,
+    transcript_path_resolver::{
+        extract_project_name, extract_transcript_path, extract_working_directory,
+        try_resolve_codex_transcript_path,
+    },
 };
 
 /// 单个 AI 工具会话的快照状态
@@ -115,9 +118,7 @@ impl SessionSnapshot {
             "UserPromptSubmit" => Self::handle_user_prompt_submit(state, evt),
             "PreToolUse" if Self::should_block_question_tool(evt) => {
                 let sid = state.session_id.clone();
-                let tool_name = evt
-                    .tool_name
-                    .clone()
+                let tool_name = hook_tool_classifier::get_tool_name(evt)
                     .or_else(|| state.current_tool_name.clone());
                 let description = Self::format_tool_description(evt);
                 let question = Self::extract_question_data(&sid, evt);
@@ -137,9 +138,7 @@ impl SessionSnapshot {
             }
             "PreToolUse" if Self::has_approval_needed_signal(evt) => {
                 let sid = state.session_id.clone();
-                let tool_name = evt
-                    .tool_name
-                    .clone()
+                let tool_name = hook_tool_classifier::get_tool_name(evt)
                     .or_else(|| state.current_tool_name.clone());
                 let description = Self::format_tool_description(evt);
                 let permission = Self::build_permission_request(&state, evt, "PreToolUse");
@@ -158,9 +157,7 @@ impl SessionSnapshot {
                 )
             }
             "PreToolUse" => {
-                let tool_name = evt
-                    .tool_name
-                    .clone()
+                let tool_name = hook_tool_classifier::get_tool_name(evt)
                     .or_else(|| state.current_tool_name.clone());
                 let description = Self::format_tool_description(evt);
 
@@ -537,9 +534,7 @@ impl SessionSnapshot {
     ) -> PermissionRequest {
         PermissionRequest {
             session_id: state.session_id.clone(),
-            tool_name: evt
-                .tool_name
-                .clone()
+            tool_name: hook_tool_classifier::get_tool_name(evt)
                 .or_else(|| state.current_tool_name.clone())
                 .unwrap_or_default(),
             tool_use_id: evt.tool_use_id.clone(),
@@ -564,11 +559,9 @@ impl SessionSnapshot {
     }
 
     fn should_block_question_tool(evt: &HookEvent) -> bool {
-        // ponytail: 简化实现，检查是否是 AskUserQuestion 工具
-        evt.tool_name
-            .as_ref()
-            .map(|name| name == "AskUserQuestion" || name == "RequestUserInput")
-            .unwrap_or(false)
+        let source = evt.source.as_deref().unwrap_or("unknown");
+        let normalized = Self::normalize_event_name(source, &evt.event_name);
+        hook_tool_classifier::should_block_question_tool(evt, &normalized)
     }
 
     fn has_approval_needed_signal(evt: &HookEvent) -> bool {
@@ -637,13 +630,169 @@ impl SessionSnapshot {
         obj.contains_key("question") || obj.contains_key("questions")
     }
 
-    fn extract_question_data(session_id: &str, _evt: &HookEvent) -> QuestionData {
-        // ponytail: 简化实现，返回空问题数据
-        // 完整实现需要在 Task 1.6 (Core Services) 中完成
+    fn extract_question_data(session_id: &str, evt: &HookEvent) -> QuestionData {
+        let Some(input) = Self::get_question_payload(evt) else {
+            return QuestionData {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            };
+        };
+
+        let question_items = Self::extract_question_items(input);
+        let first_item = question_items.as_ref().and_then(|items| items.first());
+        let question = input
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| Self::extract_question_text_from_questions(input));
+        let options = Self::extract_question_options(input)
+            .or_else(|| first_item.and_then(|i| i.options.clone()));
+        let header = get_string_field(input, &["header", "title"])
+            .or_else(|| first_item.and_then(|i| i.header.clone()));
+        let multi_select =
+            Self::get_boolean_field(input, &["multiSelect", "multi_select", "multiple"])
+                .unwrap_or_else(|| first_item.map(|i| i.multi_select).unwrap_or(false));
+
         QuestionData {
             session_id: session_id.to_string(),
-            ..Default::default()
+            id: get_string_field(input, &["id"]),
+            question: if question.trim().is_empty() {
+                first_item.map(|i| i.question.clone()).unwrap_or_default()
+            } else {
+                question
+            },
+            header,
+            options,
+            multi_select,
+            is_multi_question: question_items
+                .as_ref()
+                .map(|q| q.len() > 1)
+                .unwrap_or(false),
+            questions: question_items,
+            hook_event_name: Self::normalize_event_name(
+                evt.source.as_deref().unwrap_or("unknown"),
+                &evt.event_name,
+            ),
+            is_ask_user_question: hook_tool_classifier::is_ask_user_question(evt),
+            is_codex_request_user_input: hook_tool_classifier::is_codex_request_user_input(evt),
+            original_input: Some(input.clone()),
         }
+    }
+
+    fn get_question_payload(evt: &HookEvent) -> Option<&serde_json::Value> {
+        if Self::contains_question(&evt.tool_input) {
+            return evt.tool_input.as_ref();
+        }
+        if Self::contains_question_value(&evt.raw_json) {
+            return Some(&evt.raw_json);
+        }
+        None
+    }
+
+    fn extract_question_text_from_questions(input: &serde_json::Value) -> String {
+        let Some(questions) = input.get("questions") else {
+            return String::new();
+        };
+        if let Some(text) = questions.as_str() {
+            return text.to_string();
+        }
+        let Some(items) = questions.as_array() else {
+            return String::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                item.as_str().map(str::to_string).or_else(|| {
+                    item.get("question")
+                        .and_then(|q| q.as_str())
+                        .map(str::to_string)
+                })
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn extract_question_items(input: &serde_json::Value) -> Option<Vec<QuestionItem>> {
+        let items = input.get("questions")?.as_array()?;
+        let questions: Vec<QuestionItem> = items
+            .iter()
+            .filter_map(|item| {
+                if let Some(text) = item.as_str() {
+                    let text = text.trim();
+                    return (!text.is_empty()).then(|| QuestionItem {
+                        id: None,
+                        question: text.to_string(),
+                        header: None,
+                        options: None,
+                        multi_select: false,
+                        allow_free_text: true,
+                    });
+                }
+
+                let text = get_string_field(item, &["question", "text", "prompt"])?;
+                if text.trim().is_empty() {
+                    return None;
+                }
+                Some(QuestionItem {
+                    id: get_string_field(item, &["id"]),
+                    question: text,
+                    header: get_string_field(item, &["header", "title"]),
+                    options: Self::extract_question_options(item),
+                    multi_select: Self::get_boolean_field(
+                        item,
+                        &["multiSelect", "multi_select", "multiple"],
+                    )
+                    .unwrap_or(false),
+                    allow_free_text: true,
+                })
+            })
+            .collect();
+        (!questions.is_empty()).then_some(questions)
+    }
+
+    fn extract_question_options(input: &serde_json::Value) -> Option<Vec<QuestionOption>> {
+        let options = input.get("options")?.as_array()?;
+        let out: Vec<QuestionOption> = options
+            .iter()
+            .filter_map(|option| {
+                if let Some(label) = option.as_str() {
+                    let label = label.trim();
+                    return (!label.is_empty()).then(|| QuestionOption {
+                        label: label.to_string(),
+                        description: None,
+                        value: Some(label.to_string()),
+                    });
+                }
+
+                let label = get_string_field(option, &["label", "text", "value"])?;
+                if label.trim().is_empty() {
+                    return None;
+                }
+                Some(QuestionOption {
+                    description: get_string_field(option, &["description"]),
+                    value: get_string_field(option, &["value"]).or_else(|| Some(label.clone())),
+                    label,
+                })
+            })
+            .collect();
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn get_boolean_field(json: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+        for key in keys {
+            match json.get(*key) {
+                None => continue,
+                Some(serde_json::Value::Bool(value)) => return Some(*value),
+                Some(serde_json::Value::String(text)) => {
+                    if let Ok(value) = text.parse::<bool>() {
+                        return Some(value);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        None
     }
 }
 
@@ -781,5 +930,132 @@ mod tests {
 
         let (state, _) = SessionSnapshot::reduce_event(None, &evt);
         assert_eq!(state.project_name.as_deref(), Some("Explicit"));
+    }
+
+    #[test]
+    fn codex_request_user_input_pre_tool_use_shows_question_card() {
+        let evt = HookEvent::from_json(
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "test-123",
+                "tool_name": "request_user_input",
+                "tool_input": {
+                    "questions": [
+                        { "id": "next", "question": "Next step?" }
+                    ]
+                }
+            }),
+            Some("codex"),
+        )
+        .unwrap();
+
+        let (state, effect) = SessionSnapshot::reduce_event(None, &evt);
+
+        assert_eq!(state.status, AgentStatus::WaitingQuestion);
+        let SideEffect::ShowQuestionCard { question, .. } = effect else {
+            panic!("expected question card");
+        };
+        assert!(question.is_codex_request_user_input);
+        assert_eq!(question.hook_event_name, "PreToolUse");
+        assert_eq!(
+            question.questions.as_ref().unwrap()[0].id.as_deref(),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn codex_request_user_input_parses_ids_options_and_multiple_flag() {
+        let evt = HookEvent::from_json(
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "test-123",
+                "tool_name": "functions.request_user_input",
+                "tool_input": {
+                    "questions": [
+                        {
+                            "id": "approach",
+                            "header": "Choose approach",
+                            "question": "Which approach?",
+                            "options": [
+                                {
+                                    "label": "Fast",
+                                    "description": "Ship quickly",
+                                    "value": "fast"
+                                },
+                                {
+                                    "label": "Safe",
+                                    "description": "More checks",
+                                    "value": "safe"
+                                }
+                            ]
+                        },
+                        {
+                            "id": "checks",
+                            "header": "Checks",
+                            "question": "Which checks?",
+                            "multiple": true,
+                            "options": [
+                                { "label": "Build", "value": "build" },
+                                { "label": "Tests", "value": "tests" }
+                            ]
+                        }
+                    ]
+                }
+            }),
+            Some("codex"),
+        )
+        .unwrap();
+
+        let (state, effect) = SessionSnapshot::reduce_event(None, &evt);
+
+        assert_eq!(state.status, AgentStatus::WaitingQuestion);
+        let SideEffect::ShowQuestionCard { question, .. } = effect else {
+            panic!("expected question card");
+        };
+        let questions = question.questions.as_ref().unwrap();
+
+        assert!(question.is_codex_request_user_input);
+        assert!(!question.is_ask_user_question);
+        assert!(question.is_multi_question);
+        assert_eq!(questions[0].id.as_deref(), Some("approach"));
+        assert_eq!(
+            questions[0].options.as_ref().unwrap()[0]
+                .description
+                .as_deref(),
+            Some("Ship quickly")
+        );
+        assert_eq!(
+            questions[0].options.as_ref().unwrap()[0].value.as_deref(),
+            Some("fast")
+        );
+        assert_eq!(questions[1].id.as_deref(), Some("checks"));
+        assert!(questions[1].multi_select);
+    }
+
+    #[test]
+    fn codex_request_user_input_permission_request_with_nested_function_shows_approval() {
+        let evt = HookEvent::from_json(
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "test-123",
+                "function": { "name": "functions.request_user_input" },
+                "tool_input": {
+                    "questions": [
+                        { "id": "next", "question": "Next step?" }
+                    ]
+                }
+            }),
+            Some("codex"),
+        )
+        .unwrap();
+
+        let (state, effect) = SessionSnapshot::reduce_event(None, &evt);
+
+        assert_eq!(state.status, AgentStatus::WaitingApproval);
+        let SideEffect::ShowApprovalCard { request, .. } = effect else {
+            panic!("expected approval card");
+        };
+        assert_eq!(request.tool_name, "functions.request_user_input");
+        assert_eq!(request.hook_event_name, "PermissionRequest");
     }
 }

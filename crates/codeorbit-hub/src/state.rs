@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
-use tokio::sync::{broadcast, oneshot, RwLock};
+use serde_json::{Value, json};
+use tokio::sync::{RwLock, broadcast, oneshot};
 
 use codeorbit_contracts::{
     ChatMessageDto, HubEventDto, PendingActionDto, PendingResolutionDto, PermissionRequestDto,
@@ -1205,6 +1205,36 @@ mod tests {
         }
     }
 
+    fn codex_request_user_input_event() -> HookEvent {
+        HookEvent {
+            event_name: "PreToolUse".to_string(),
+            session_id: Some("s1".to_string()),
+            tool_name: Some("functions.request_user_input".to_string()),
+            tool_use_id: None,
+            agent_id: None,
+            tool_input: Some(json!({
+                "questions": [
+                    { "id": "next", "question": "Next step?" }
+                ]
+            })),
+            raw_json: json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "s1",
+                "tool_name": "functions.request_user_input",
+                "tool_input": {
+                    "questions": [
+                        { "id": "next", "question": "Next step?" }
+                    ]
+                }
+            }),
+            source: Some("codex".to_string()),
+            parent_pid: None,
+            tracked_pid: None,
+            tracked_pid_kind: None,
+            tracked_process_started_at_utc: None,
+        }
+    }
+
     fn pending_action_id(outcome: &BlockingOutcome) -> String {
         match outcome {
             BlockingOutcome::Pending(h) => h.action_id.clone(),
@@ -1249,6 +1279,20 @@ mod tests {
         let outcome = state.begin_blocking_event(permission_event("s1", "Bash"));
         assert!(matches!(outcome, BlockingOutcome::Pending(_)));
         assert_eq!(state.get_pending_actions().len(), 1);
+    }
+
+    #[test]
+    fn codex_request_user_input_enqueues_pending_question() {
+        let mut state = HubState::new();
+        let outcome = state.begin_blocking_event(codex_request_user_input_event());
+
+        assert!(matches!(outcome, BlockingOutcome::Pending(_)));
+        let pending = state.get_pending_actions();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "question");
+        let question = pending[0].question.as_ref().unwrap();
+        assert!(question.is_codex_request_user_input);
+        assert_eq!(question.questions[0].id.as_deref(), Some("next"));
     }
 
     #[tokio::test]
