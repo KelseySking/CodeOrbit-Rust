@@ -6,7 +6,7 @@ use std::process::Command;
 use codeorbit_core::sources::adapter_trait::SourceAdapter;
 use codeorbit_core::sources::hook_installation_utils::set_bridge_executable_path;
 use codeorbit_core::sources::plugin_models::HookInstallationSpec;
-use codeorbit_core::sources::{SourcePluginLoader, hook_strategy_factory};
+use codeorbit_core::sources::{hook_strategy_factory, SourcePluginLoader};
 
 use crate::config_installer;
 
@@ -153,23 +153,47 @@ fn wsl_home(distro: &str) -> Result<String, String> {
 }
 
 fn wsl_path(distro: &str, path: &PathBuf) -> Result<String, String> {
+    // `wsl -- wslpath` treats `\` as escapes, so `C:\Users\...` becomes `C:Users...`.
+    // Always pass a slash-normalized Windows path; fall back to /mnt/<drive>/... if needed.
+    let win = windows_path_for_wslpath(path);
     let output = Command::new("wsl.exe")
-        .args(["-d", distro, "--", "wslpath", "-a"])
-        .arg(path)
+        .args(["-d", distro, "--", "wslpath", "-a", &win])
         .output()
         .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
-    if !output.status.success() {
-        return Err(command_error("wslpath", &output.stderr));
+    if output.status.success() {
+        let converted = decode_wsl_output(&output.stdout).trim().to_string();
+        if !converted.is_empty() {
+            return Ok(converted);
+        }
     }
-    let converted = decode_wsl_output(&output.stdout).trim().to_string();
-    if converted.is_empty() {
+    if let Some(fallback) = windows_to_wsl_mnt_path(path) {
+        return Ok(fallback);
+    }
+    if !output.status.success() {
+        Err(command_error("wslpath", &output.stderr))
+    } else {
         Err(format!(
             "could not convert path for WSL: {}",
             path.display()
         ))
-    } else {
-        Ok(converted)
     }
+}
+
+/// Normalize a Windows path for `wslpath` (backslashes → slashes).
+fn windows_path_for_wslpath(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Best-effort `C:\foo` → `/mnt/c/foo` when `wslpath` is unavailable.
+fn windows_to_wsl_mnt_path(path: &std::path::Path) -> Option<String> {
+    let normalized = windows_path_for_wslpath(path);
+    let mut chars = normalized.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return None;
+    }
+    let rest = chars.as_str().trim_start_matches('/');
+    Some(format!("/mnt/{}/{rest}", drive.to_ascii_lowercase()))
 }
 
 fn command_error(command: &str, stderr: &[u8]) -> String {
@@ -317,6 +341,31 @@ mod tests {
         assert_eq!(
             translate_home_path("%APPDATA%/tool/config.json", home),
             r"\\wsl.localhost\Ubuntu\home\amiya\.config\tool\config.json"
+        );
+    }
+
+    #[test]
+    fn normalizes_windows_path_for_wslpath() {
+        assert_eq!(
+            windows_path_for_wslpath(std::path::Path::new(
+                r"C:\Users\amiya\AppData\Local\Programs\codeorbit-bridge.exe"
+            )),
+            "C:/Users/amiya/AppData/Local/Programs/codeorbit-bridge.exe"
+        );
+    }
+
+    #[test]
+    fn maps_windows_path_to_mnt() {
+        assert_eq!(
+            windows_to_wsl_mnt_path(std::path::Path::new(
+                r"C:\Users\amiya\AppData\Local\Programs\codeorbit-bridge.exe"
+            ))
+            .as_deref(),
+            Some("/mnt/c/Users/amiya/AppData/Local/Programs/codeorbit-bridge.exe")
+        );
+        assert_eq!(
+            windows_to_wsl_mnt_path(std::path::Path::new("/home/amiya/bin")),
+            None
         );
     }
 }
