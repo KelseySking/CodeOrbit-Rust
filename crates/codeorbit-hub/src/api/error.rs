@@ -1,10 +1,11 @@
-//! API 错误类型 — 统一 ApiErrorDto 响应
+//! API 错误类型 — 统一 ApiErrorDto 响应 + error.log 落盘
 
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use codeorbit_contracts::ApiErrorDto;
+use codeorbit_core::services::log_error;
 
 /// API 错误
 #[derive(Debug)]
@@ -29,6 +30,15 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message) = self.parts();
+        let status_s = status.as_u16().to_string();
+        log_error(
+            "api",
+            &message,
+            &[
+                ("code", code),
+                ("status", status_s.as_str()),
+            ],
+        );
         (
             status,
             Json(ApiErrorDto {

@@ -19,7 +19,7 @@ mod codex_hook_response_builder;
 mod legacy_question_response_builder;
 
 pub use codex_home::resolve_codex_home;
-pub use event_logger::EventLogger;
+pub use event_logger::{EventLogger, LogKind, log_error};
 pub use event_normalizer::{normalize_event_name, normalize_field_name};
 pub use hook_tool_classifier::HookQuestionToolKind;
 pub use l10n::L10n;

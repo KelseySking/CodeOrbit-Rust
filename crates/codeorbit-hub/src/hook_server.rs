@@ -13,7 +13,7 @@ use codeorbit_core::ipc::{
     IpcServer, IpcStream, full_path, read_message_async, write_message_async,
 };
 use codeorbit_core::models::HookEvent;
-use codeorbit_core::services::{hook_tool_classifier, normalize_event_name};
+use codeorbit_core::services::{hook_tool_classifier, log_error, normalize_event_name};
 
 use crate::state::{HubState, handle_blocking_event};
 
@@ -25,10 +25,17 @@ pub struct HookServer;
 impl HookServer {
     /// 持续监听并处理 Bridge 连接（由调用方 spawn，并在关闭时 abort）
     pub async fn run(state: Arc<RwLock<HubState>>, session_timeout: Duration) {
-        let mut server = match IpcServer::bind(&full_path()).await {
+        let path = full_path();
+        let mut server = match IpcServer::bind(&path).await {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("HookServer 绑定失败: {e}");
+                let detail = e.to_string();
+                tracing::error!("HookServer 绑定失败: {detail}");
+                log_error(
+                    "hook_server",
+                    &detail,
+                    &[("op", "bind"), ("path", path.as_str())],
+                );
                 return;
             }
         };
@@ -40,7 +47,9 @@ impl HookServer {
                     tokio::spawn(handle_connection(stream, state, session_timeout));
                 }
                 Err(e) => {
-                    tracing::warn!("HookServer accept 错误: {e}");
+                    let detail = e.to_string();
+                    tracing::warn!("HookServer accept 错误: {detail}");
+                    log_error("hook_server", &detail, &[("op", "accept")]);
                 }
             }
         }
@@ -56,7 +65,40 @@ async fn handle_connection(
     let json =
         match tokio::time::timeout(READ_MESSAGE_TIMEOUT, read_message_async(&mut stream)).await {
             Ok(Ok(Some(j))) if !j.trim().is_empty() => j,
-            _ => {
+            Ok(Ok(Some(_))) => {
+                log_error(
+                    "hook_server",
+                    "empty hook payload",
+                    &[("op", "read_message")],
+                );
+                let _ = write_message_async(&mut stream, "{}").await;
+                return;
+            }
+            Ok(Ok(None)) => {
+                log_error(
+                    "hook_server",
+                    "client closed before message",
+                    &[("op", "read_message")],
+                );
+                let _ = write_message_async(&mut stream, "{}").await;
+                return;
+            }
+            Ok(Err(e)) => {
+                let detail = e.to_string();
+                log_error(
+                    "hook_server",
+                    &detail,
+                    &[("op", "read_message")],
+                );
+                let _ = write_message_async(&mut stream, "{}").await;
+                return;
+            }
+            Err(_) => {
+                log_error(
+                    "hook_server",
+                    "read message timeout",
+                    &[("op", "read_message"), ("timeout_secs", "10")],
+                );
                 let _ = write_message_async(&mut stream, "{}").await;
                 return;
             }
@@ -66,6 +108,12 @@ async fn handle_connection(
         .ok()
         .and_then(|v| HookEvent::from_json(&v, None))
     else {
+        let preview: String = json.chars().take(200).collect();
+        log_error(
+            "hook_server",
+            "invalid hook payload",
+            &[("op", "parse"), ("preview", preview.as_str())],
+        );
         let _ = write_message_async(&mut stream, "{}").await;
         return;
     };

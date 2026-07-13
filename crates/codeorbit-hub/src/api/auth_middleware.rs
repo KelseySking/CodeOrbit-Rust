@@ -8,6 +8,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use codeorbit_contracts::ApiErrorDto;
+use codeorbit_core::services::log_error;
 
 use super::app_state::AppState;
 
@@ -21,6 +22,18 @@ pub async fn authorize(State(app): State<AppState>, request: Request, next: Next
     if is_authorized(&app, &request) {
         return next.run(request).await;
     }
+
+    let method = request.method().as_str().to_string();
+    log_error(
+        "api",
+        "Missing or invalid CodeOrbit API token",
+        &[
+            ("code", "unauthorized"),
+            ("status", "401"),
+            ("method", method.as_str()),
+            ("path", path),
+        ],
+    );
 
     (
         StatusCode::UNAUTHORIZED,

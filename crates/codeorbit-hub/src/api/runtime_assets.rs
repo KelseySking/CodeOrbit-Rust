@@ -5,6 +5,7 @@ use axum::extract::State;
 use serde_json::{Value, json};
 
 use codeorbit_contracts::RuntimeAssetsDto;
+use codeorbit_core::services::log_error;
 
 use super::app_state::AppState;
 use crate::source_service;
@@ -17,6 +18,13 @@ pub async fn get_runtime_assets(State(_app): State<AppState>) -> Json<RuntimeAss
 /// POST /api/runtime-assets/repair
 pub async fn repair(State(app): State<AppState>) -> Json<Value> {
     let success = source_service::repair_runtime_assets();
+    if !success {
+        log_error(
+            "api.runtime_assets",
+            "repair_runtime_assets failed",
+            &[("op", "repair")],
+        );
+    }
     let assets = source_service::get_runtime_assets();
 
     // 广播源状态变化
