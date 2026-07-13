@@ -26,6 +26,9 @@ fn log_source_failure(op: &str, result: &SourceOperationResultDto, distro: Optio
     if let Some(d) = distro {
         fields.push(("distro", d));
     }
+    if let Some(code) = result.code.as_deref() {
+        fields.push(("code", code));
+    }
     log_error("api.sources", &result.message, &fields);
 }
 
@@ -66,17 +69,27 @@ pub async fn get_source_status(
 /// GET /api/sources/wsl/distros
 pub async fn list_wsl_distros(State(_app): State<AppState>) -> impl IntoResponse {
     match source_service::list_wsl_distros() {
-        Ok(distros) => (StatusCode::OK, Json(json!({ "distros": distros }))),
+        Ok(dto) => (StatusCode::OK, Json(dto)).into_response(),
         Err(message) => {
             log_error(
                 "api.sources",
                 &message,
-                &[("op", "list_wsl_distros"), ("status", "400")],
+                &[
+                    ("op", "list_wsl_distros"),
+                    ("status", "400"),
+                    ("code", "wsl_unavailable"),
+                ],
             );
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "distros": [], "message": message })),
+                Json(json!({
+                    "distros": [],
+                    "defaultDistro": null,
+                    "message": message,
+                    "code": "wsl_unavailable",
+                })),
             )
+                .into_response()
         }
     }
 }
@@ -86,11 +99,25 @@ pub async fn get_wsl_source_status(
     State(_app): State<AppState>,
     Path(source): Path<String>,
     Query(query): Query<WslQuery>,
-) -> Json<SourceStatusDto> {
-    Json(source_service::get_wsl_source_status(
-        &source,
-        query.distro.as_deref(),
-    ))
+) -> impl IntoResponse {
+    let status = source_service::get_wsl_source_status(&source, query.distro.as_deref());
+    // probe 失败：400 + SourceStatusDto（installed 不可信）
+    if status.probe_ok == Some(false) {
+        if let Some(err) = status.error.as_deref() {
+            log_error(
+                "api.sources",
+                err,
+                &[
+                    ("op", "wsl_status"),
+                    ("source", status.source.as_str()),
+                    ("status", "400"),
+                    ("code", "wsl_unavailable"),
+                ],
+            );
+        }
+        return (StatusCode::BAD_REQUEST, Json(status)).into_response();
+    }
+    (StatusCode::OK, Json(status)).into_response()
 }
 
 /// POST /api/sources/:source/install
@@ -142,7 +169,11 @@ pub async fn install_wsl(
     Query(query): Query<WslQuery>,
 ) -> impl IntoResponse {
     let result = source_service::install_wsl(&source, query.distro.as_deref());
-    log_source_failure("wsl_install", &result, query.distro.as_deref());
+    log_source_failure(
+        "wsl_install",
+        &result,
+        result.distro.as_deref().or(query.distro.as_deref()),
+    );
     publish_source_operation(&app, &result).await;
     let status = if result.success {
         StatusCode::OK
@@ -159,7 +190,11 @@ pub async fn uninstall_wsl(
     Query(query): Query<WslQuery>,
 ) -> impl IntoResponse {
     let result = source_service::uninstall_wsl(&source, query.distro.as_deref());
-    log_source_failure("wsl_uninstall", &result, query.distro.as_deref());
+    log_source_failure(
+        "wsl_uninstall",
+        &result,
+        result.distro.as_deref().or(query.distro.as_deref()),
+    );
     publish_source_operation(&app, &result).await;
     let status = if result.success {
         StatusCode::OK
@@ -176,7 +211,11 @@ pub async fn repair_wsl(
     Query(query): Query<WslQuery>,
 ) -> impl IntoResponse {
     let result = source_service::repair_wsl(&source, query.distro.as_deref());
-    log_source_failure("wsl_repair", &result, query.distro.as_deref());
+    log_source_failure(
+        "wsl_repair",
+        &result,
+        result.distro.as_deref().or(query.distro.as_deref()),
+    );
     publish_source_operation(&app, &result).await;
     let status = if result.success {
         StatusCode::OK
@@ -187,15 +226,17 @@ pub async fn repair_wsl(
 }
 
 /// POST /api/sources/repair-all
+///
+/// 仅修复 **Windows 侧** 已安装 source；不含 WSL。
 pub async fn repair_all(State(app): State<AppState>) -> impl IntoResponse {
     let success = source_service::repair_all();
     if !success {
         log_error(
             "api.sources",
             "repair_all failed",
-            &[("op", "repair_all"), ("status", "200")],
+            &[("op", "repair_all"), ("status", "200"), ("scope", "windows")],
         );
     }
     publish_sources(&app).await;
-    Json(json!({ "success": success }))
+    Json(json!({ "success": success, "scope": "windows" }))
 }

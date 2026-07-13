@@ -83,7 +83,8 @@ query token 主要用于简单 WebSocket 客户端和本地工具。UI 客户端
 | 类别 | Endpoint |
 | --- | --- |
 | Runtime | `GET /health`, `GET /version`, `GET /capabilities` |
-| Sources | `GET /sources`, `GET /sources/{source}`, `GET /sources/{source}/status`, `POST /sources/{source}/install`, `POST /sources/{source}/uninstall`, `POST /sources/{source}/repair`, `POST /sources/repair-all` |
+| Sources | `GET /sources`, `GET /sources/{source}`, `GET /sources/{source}/status`, `POST /sources/{source}/install`, `POST /sources/{source}/uninstall`, `POST /sources/{source}/repair`, `POST /sources/repair-all`（仅 Windows 侧，`scope: "windows"`） |
+| WSL Sources | `GET /sources/wsl/distros`，`GET /sources/{source}/wsl/status`，`POST /sources/{source}/wsl/install|uninstall|repair`（可选 `?distro=`；status 含 `probeOk`/`error`） |
 | Runtime assets | `GET /runtime-assets`, `POST /runtime-assets/repair` |
 | Sessions | `GET /sessions`, `GET /sessions/{sessionId}`, `GET /sessions/{sessionId}/messages`, `POST /sessions/{sessionId}/dismiss`, `POST /sessions/{sessionId}/activate-terminal` |
 | Pending actions | `GET /pending`, `GET /pending/{actionId}`, `POST /permissions/{actionId}/allow`, `POST /permissions/{actionId}/deny`, `POST /questions/{actionId}/answer`, `POST /questions/{actionId}/answer-current`, `POST /questions/{actionId}/dismiss` |

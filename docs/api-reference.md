@@ -89,15 +89,15 @@ codeorbit-host.exe --host 0.0.0.0 --port 32145 --token <token>
 | `GET` | `/api/sources` | 列出支持的 CLI source 和安装状态。 |
 | `GET` | `/api/sources/{source}` | 获取 source 状态。 |
 | `GET` | `/api/sources/{source}/status` | source 状态别名。 |
-| `GET` | `/api/sources/wsl/distros` | 列出已安装的 WSL 发行版。 |
-| `GET` | `/api/sources/{source}/wsl/status?distro=<name>` | 获取某个 WSL 发行版内的 source hook 状态。 |
+| `GET` | `/api/sources/wsl/distros` | 列出用户侧 WSL 发行版（含 state/version/default；过滤 Docker）。 |
+| `GET` | `/api/sources/{source}/wsl/status?distro=<name>` | WSL 内 hook 状态（含 `probeOk`/`error`）。 |
 | `POST` | `/api/sources/{source}/install` | 安装或更新某个 source 的 CodeOrbit hook。 |
 | `POST` | `/api/sources/{source}/uninstall` | 卸载 CodeOrbit 自己拥有的 hook entry。 |
 | `POST` | `/api/sources/{source}/repair` | 修复某个 source 的 hook 配置。 |
 | `POST` | `/api/sources/{source}/wsl/install?distro=<name>` | 在 WSL 内安装调用 Windows bridge 的 source hook。 |
 | `POST` | `/api/sources/{source}/wsl/uninstall?distro=<name>` | 卸载 WSL 内 CodeOrbit 自己拥有的 hook entry。 |
 | `POST` | `/api/sources/{source}/wsl/repair?distro=<name>` | 修复某个 WSL source hook 配置。 |
-| `POST` | `/api/sources/repair-all` | 修复所有已安装 source。 |
+| `POST` | `/api/sources/repair-all` | 仅修复 Windows 侧已安装 source（`scope: "windows"`）。 |
 | `GET` | `/api/runtime-assets` | 获取 Runtime hook script 和 bridge 路径。 |
 | `POST` | `/api/runtime-assets/repair` | 修复共享 Runtime 资产。 |
 
@@ -213,6 +213,8 @@ codeorbit-host.exe --host 0.0.0.0 --port 32145 --token <token>
 }
 ```
 
+Windows 侧状态不含 `distro` / `probeOk` / `error`（字段省略）。
+
 ### Source install/uninstall/repair
 
 请求体为空。
@@ -230,35 +232,70 @@ POST /api/sources/codex/repair
   "source": "codex",
   "success": true,
   "installed": true,
-  "message": "installed"
+  "message": "codex installed"
 }
 ```
 
-失败时通常返回 `400`，响应体仍是 `SourceOperationResultDto`，`success=false`。
+失败时通常返回 `400`，响应体仍是 `SourceOperationResultDto`，`success=false`，并带稳定 `code`（见下表）。
 
 ### WSL source 操作
 
-`GET /api/sources/wsl/distros` 返回已安装的 WSL 发行版：
+`GET /api/sources/wsl/distros` 返回**用户侧** WSL 发行版（已过滤 `docker-desktop*` 等系统 distro）：
 
 ```json
 {
-  "distros": ["Ubuntu"]
+  "distros": [
+    {
+      "name": "Ubuntu",
+      "state": "Running",
+      "version": 2,
+      "isDefault": true
+    },
+    {
+      "name": "Debian",
+      "state": "Stopped",
+      "version": 2,
+      "isDefault": false
+    }
+  ],
+  "defaultDistro": "Ubuntu"
 }
 ```
 
-`GET /api/sources/{source}/wsl/status?distro=Ubuntu` 返回 `SourceStatusDto`。
+WSL 不可用时返回 `400`：`{ "distros": [], "defaultDistro": null, "message": "...", "code": "wsl_unavailable" }`。
 
-`POST /api/sources/{source}/wsl/install`、`/uninstall` 和 `/repair` 支持可选 `distro` query。未指定时 Runtime 使用默认 WSL 发行版。WSL hook 会通过 WSL interop 调用 Windows `codeorbit-bridge.exe`，并显式传入 `--source <source>`。
+`GET /api/sources/{source}/wsl/status?distro=Ubuntu` 返回 `SourceStatusDto`，额外字段：
+
+```json
+{
+  "source": "claude",
+  "supported": true,
+  "installed": true,
+  "displayName": "Claude Code",
+  "distro": "Ubuntu",
+  "probeOk": true
+}
+```
+
+- `probeOk=false` 时 **不要** 把 `installed=false` 当成「未安装」；此时 HTTP `400`，并带 `error` 说明探测失败原因。
+- `distro` 为实际解析到的发行版（显式 query 或默认）。
+
+`POST /api/sources/{source}/wsl/install`、`/uninstall` 和 `/repair` 支持可选 `distro` query。未指定时 Runtime 使用默认用户侧 WSL 发行版。成功/失败响应均可能带 `distro`；失败带 `code`。
+
+WSL hook 通过 WSL interop 调用 Windows `codeorbit-bridge.exe`，命令形如 `"/mnt/c/.../codeorbit-bridge.exe" --source <source>`。
 
 ### `POST /api/sources/repair-all`
 
 请求体为空。
 
+**仅修复 Windows 侧**已安装 source，**不含 WSL**。
+
 响应：
 
 ```json
 {
-  "success": true
+  "success": true,
+  "scope": "windows"
 }
 ```
 
@@ -593,8 +630,9 @@ Runtime 会向 CLI hook 返回关闭/拒绝类响应。
 | `id` | string | source key，例如 `codex`、`claude`。 |
 | `displayName` | string | 展示名。 |
 | `iconName` | string | 图标 key。 |
-| `installed` | boolean | 当前 hook 是否已安装。 |
+| `installed` | boolean | 当前 hook 是否已安装（Windows 侧）。 |
 | `capabilities` | SourceCapabilitiesDto | source 能力。 |
+| `sourceType` | string | `bundled` 或 `user`。 |
 
 ### SourceCapabilitiesDto
 
@@ -605,6 +643,51 @@ Runtime 会向 CLI hook 返回关闭/拒绝类响应。
 | `question` | boolean | 是否支持问答。 |
 | `transcript` | boolean | 是否支持 transcript。 |
 | `alwaysAllow` | boolean | 是否支持 always allow。 |
+
+### SourceStatusDto
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `source` | string | source key。 |
+| `supported` | boolean | 是否为已知 source。 |
+| `installed` | boolean | hook 是否已安装；`probeOk=false` 时不可信。 |
+| `displayName` | string | 展示名。 |
+| `distro` | string? | WSL 状态时的发行版；Windows 侧省略。 |
+| `probeOk` | boolean? | WSL 探测是否成功；Windows 侧省略。 |
+| `error` | string? | 探测失败原因。 |
+
+### SourceOperationResultDto
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `source` | string | source key。 |
+| `success` | boolean | 操作是否成功。 |
+| `installed` | boolean | 操作后是否仍处于已安装。 |
+| `message` | string | 人类可读说明。 |
+| `distro` | string? | WSL 操作实际使用的发行版。 |
+| `code` | string? | 失败时的稳定错误码；成功时省略。 |
+
+常见 `code`：
+
+| code | 含义 |
+| --- | --- |
+| `unsupported_source` | 未知 source。 |
+| `invalid_distro` | Docker/系统 distro 等不可用发行版。 |
+| `missing_bridge` | 缺少 Windows bridge 可执行文件。 |
+| `wsl_unavailable` | WSL 列表/探测/路径转换失败。 |
+| `hook_write_failed` | 写入 hook 配置失败。 |
+| `operation_failed` | 其他业务失败。 |
+
+### WslDistroDto / WslDistrosDto
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `distros` | WslDistroDto[] | 用户侧发行版列表。 |
+| `defaultDistro` | string? | 解析后的默认发行版。 |
+| `name` | string | 发行版名。 |
+| `state` | string | 如 `Running` / `Stopped`。 |
+| `version` | number? | WSL 版本（通常 1/2）。 |
+| `isDefault` | boolean | 是否为默认（过滤 Docker 后可能提升）。 |
 
 ### SessionDto
 

@@ -88,7 +88,7 @@ If you are building a desktop app, web UI, browser extension, IDE plugin, mobile
 | `GET` | `/api/sources` | List supported CLI sources and install status. |
 | `GET` | `/api/sources/{source}` | Get source status. |
 | `GET` | `/api/sources/{source}/status` | Source status alias. |
-| `GET` | `/api/sources/wsl/distros` | List installed WSL distributions. |
+| `GET` | `/api/sources/wsl/distros` | List user WSL distros (name/state/version/default; Docker filtered). |
 | `GET` | `/api/sources/{source}/wsl/status?distro=<name>` | Get source hook status inside a WSL distribution. |
 | `POST` | `/api/sources/{source}/install` | Install or update the CodeOrbit hook for one source. |
 | `POST` | `/api/sources/{source}/uninstall` | Remove CodeOrbit-owned hook entries. |
@@ -96,7 +96,7 @@ If you are building a desktop app, web UI, browser extension, IDE plugin, mobile
 | `POST` | `/api/sources/{source}/wsl/install?distro=<name>` | Install a source hook inside WSL that calls the Windows bridge. |
 | `POST` | `/api/sources/{source}/wsl/uninstall?distro=<name>` | Remove CodeOrbit-owned hook entries inside WSL. |
 | `POST` | `/api/sources/{source}/wsl/repair?distro=<name>` | Repair one WSL source hook configuration. |
-| `POST` | `/api/sources/repair-all` | Repair every installed source. |
+| `POST` | `/api/sources/repair-all` | Repair every **Windows-side** installed source (`scope: "windows"`; not WSL). |
 | `GET` | `/api/runtime-assets` | Get Runtime hook script and bridge paths. |
 | `POST` | `/api/runtime-assets/repair` | Repair shared Runtime assets. |
 
@@ -201,6 +201,8 @@ Returns `SourceDto[]`:
 }
 ```
 
+Windows-side status omits `distro` / `probeOk` / `error`.
+
 `POST /api/sources/{source}/install`, `/uninstall`, and `/repair` have no request body. They return `SourceOperationResultDto`:
 
 ```json
@@ -208,25 +210,68 @@ Returns `SourceDto[]`:
   "source": "codex",
   "success": true,
   "installed": true,
-  "message": "installed"
+  "message": "codex installed"
 }
 ```
 
-Failures usually return `400` with `success=false`.
+Failures usually return `400` with `success=false` and a stable `code` (see DTO section).
 
 ### WSL source operations
 
-`GET /api/sources/wsl/distros` returns installed WSL distributions:
+`GET /api/sources/wsl/distros` returns **user** WSL distributions (Docker/system distros like `docker-desktop*` are filtered out):
 
 ```json
 {
-  "distros": ["Ubuntu"]
+  "distros": [
+    {
+      "name": "Ubuntu",
+      "state": "Running",
+      "version": 2,
+      "isDefault": true
+    },
+    {
+      "name": "Debian",
+      "state": "Stopped",
+      "version": 2,
+      "isDefault": false
+    }
+  ],
+  "defaultDistro": "Ubuntu"
 }
 ```
 
-`GET /api/sources/{source}/wsl/status?distro=Ubuntu` returns `SourceStatusDto`.
+When WSL is unavailable: `400` with `{ "distros": [], "defaultDistro": null, "message": "...", "code": "wsl_unavailable" }`.
 
-`POST /api/sources/{source}/wsl/install`, `/uninstall`, and `/repair` take an optional `distro` query. If omitted, Runtime uses the default WSL distro. WSL hooks call the Windows `codeorbit-bridge.exe` through WSL interop with explicit `--source <source>`.
+`GET /api/sources/{source}/wsl/status?distro=Ubuntu` returns `SourceStatusDto` with extra fields:
+
+```json
+{
+  "source": "claude",
+  "supported": true,
+  "installed": true,
+  "displayName": "Claude Code",
+  "distro": "Ubuntu",
+  "probeOk": true
+}
+```
+
+- If `probeOk` is `false`, do **not** treat `installed=false` as “not installed”; HTTP status is `400` and `error` explains the probe failure.
+- `distro` is the resolved distribution (query or default).
+
+`POST /api/sources/{source}/wsl/install`, `/uninstall`, and `/repair` take an optional `distro` query. If omitted, Runtime uses the default user distro. Responses include `distro` when known; failures include `code`.
+
+WSL hooks call Windows `codeorbit-bridge.exe` via interop, e.g. `"/mnt/c/.../codeorbit-bridge.exe" --source <source>`.
+
+### `POST /api/sources/repair-all`
+
+Repairs **Windows-side** installed sources only (**not** WSL). Response:
+
+```json
+{
+  "success": true,
+  "scope": "windows"
+}
+```
 
 ### Runtime assets
 
@@ -428,10 +473,14 @@ Step-by-step current question answer:
 
 | DTO | Fields |
 | --- | --- |
-| `SourceDto` | `id`, `displayName`, `iconName`, `installed`, `capabilities` |
+| `SourceDto` | `id`, `displayName`, `iconName`, `installed`, `capabilities`, `sourceType` |
 | `SourceCapabilitiesDto` | `hookInstall`, `approval`, `question`, `transcript`, `alwaysAllow` |
-| `SourceStatusDto` | `source`, `supported`, `installed`, `displayName` |
-| `SourceOperationResultDto` | `source`, `success`, `installed`, `message` |
+| `SourceStatusDto` | `source`, `supported`, `installed`, `displayName`, optional `distro`, `probeOk`, `error` (WSL) |
+| `SourceOperationResultDto` | `source`, `success`, `installed`, `message`, optional `distro`, `code` |
+| `WslDistrosDto` | `distros[]`, `defaultDistro` |
+| `WslDistroDto` | `name`, `state`, `version?`, `isDefault` |
+
+Stable failure `code` values: `unsupported_source`, `invalid_distro`, `missing_bridge`, `wsl_unavailable`, `hook_write_failed`, `operation_failed`.
 
 ### Session DTOs
 

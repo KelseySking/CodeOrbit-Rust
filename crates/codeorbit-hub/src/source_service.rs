@@ -2,6 +2,7 @@
 
 use codeorbit_contracts::{
     RuntimeAssetsDto, SourceCapabilitiesDto, SourceDto, SourceOperationResultDto, SourceStatusDto,
+    WslDistrosDto,
 };
 use codeorbit_core::sources::SourcePluginLoader;
 use codeorbit_core::sources::adapter_trait::SourceAdapter;
@@ -68,12 +69,18 @@ pub fn get_source_status(source: &str) -> SourceStatusDto {
             supported: false,
             installed: false,
             display_name: normalized,
+            distro: None,
+            probe_ok: None,
+            error: None,
         },
         Some(p) => SourceStatusDto {
             source: normalized.clone(),
             supported: true,
             installed: config_installer::is_plugin_installed(&normalized),
             display_name: p.display_name().to_string(),
+            distro: None,
+            probe_ok: None,
+            error: None,
         },
     }
 }
@@ -90,8 +97,8 @@ pub fn repair(source: &str) -> SourceOperationResultDto {
     run_source_operation(source, "repaired", config_installer::install_plugin)
 }
 
-pub fn list_wsl_distros() -> Result<Vec<String>, String> {
-    wsl_installer::list_distros()
+pub fn list_wsl_distros() -> Result<WslDistrosDto, String> {
+    wsl_installer::list_distros_detailed()
 }
 
 pub fn get_wsl_source_status(source: &str, distro: Option<&str>) -> SourceStatusDto {
@@ -102,18 +109,37 @@ pub fn get_wsl_source_status(source: &str, distro: Option<&str>) -> SourceStatus
         .iter()
         .find(|p| p.source_key().eq_ignore_ascii_case(&normalized));
 
+    let resolved_distro = wsl_installer::resolve_distro_name(distro).ok();
+
     match plugin {
         None => SourceStatusDto {
             source: normalized.clone(),
             supported: false,
             installed: false,
             display_name: normalized,
+            distro: resolved_distro,
+            probe_ok: Some(true),
+            error: None,
         },
-        Some(p) => SourceStatusDto {
-            source: normalized.clone(),
-            supported: true,
-            installed: wsl_installer::is_plugin_installed(&normalized, distro).unwrap_or(false),
-            display_name: p.display_name().to_string(),
+        Some(p) => match wsl_installer::is_plugin_installed(&normalized, distro) {
+            Ok(installed) => SourceStatusDto {
+                source: normalized.clone(),
+                supported: true,
+                installed,
+                display_name: p.display_name().to_string(),
+                distro: resolved_distro.or_else(|| distro.map(|d| d.to_string())),
+                probe_ok: Some(true),
+                error: None,
+            },
+            Err(message) => SourceStatusDto {
+                source: normalized.clone(),
+                supported: true,
+                installed: false,
+                display_name: p.display_name().to_string(),
+                distro: resolved_distro.or_else(|| distro.map(|d| d.to_string())),
+                probe_ok: Some(false),
+                error: Some(message),
+            },
         },
     }
 }
@@ -145,7 +171,7 @@ pub fn repair_wsl(source: &str, distro: Option<&str>) -> SourceOperationResultDt
     )
 }
 
-/// 修复所有已安装的数据源
+/// 修复所有已安装的数据源（仅 Windows 侧；不含 WSL）
 pub fn repair_all() -> bool {
     let loader = SourcePluginLoader::new();
     let mut all_ok = true;
@@ -195,6 +221,8 @@ fn run_source_operation(
             success: false,
             installed: false,
             message: format!("Unsupported source: {source}"),
+            distro: None,
+            code: Some("unsupported_source".into()),
         };
     }
 
@@ -209,6 +237,12 @@ fn run_source_operation(
         success,
         installed: config_installer::is_plugin_installed(&normalized),
         message,
+        distro: None,
+        code: if success {
+            None
+        } else {
+            Some("operation_failed".into())
+        },
     }
 }
 
@@ -231,26 +265,71 @@ fn run_wsl_source_operation(
             success: false,
             installed: false,
             message: format!("Unsupported source: {source}"),
+            distro: distro.map(|d| d.to_string()),
+            code: Some("unsupported_source".into()),
         };
     }
 
+    let resolved = wsl_installer::resolve_distro_name(distro).ok();
+
     match operation(&normalized, distro) {
-        Ok(success) => SourceOperationResultDto {
-            source: normalized.clone(),
-            success,
-            installed: wsl_installer::is_plugin_installed(&normalized, distro).unwrap_or(false),
-            message: if success {
-                format!("{normalized} {success_verb}")
-            } else {
-                format!("{normalized} WSL operation failed")
-            },
-        },
-        Err(message) => SourceOperationResultDto {
-            source: normalized,
-            success: false,
-            installed: false,
-            message,
-        },
+        Ok(success) => {
+            let used_distro = resolved
+                .or_else(|| distro.map(|d| d.to_string()))
+                .or_else(|| wsl_installer::resolve_distro_name(distro).ok());
+            SourceOperationResultDto {
+                source: normalized.clone(),
+                success,
+                installed: wsl_installer::is_plugin_installed(&normalized, distro)
+                    .unwrap_or(false),
+                message: if success {
+                    format!("{normalized} {success_verb}")
+                } else {
+                    format!("{normalized} WSL operation failed")
+                },
+                distro: used_distro,
+                code: if success {
+                    None
+                } else {
+                    Some("operation_failed".into())
+                },
+            }
+        }
+        Err(message) => {
+            let code = classify_wsl_error(&message);
+            let used_distro = resolved.or_else(|| distro.map(|d| d.to_string()));
+            SourceOperationResultDto {
+                source: normalized,
+                success: false,
+                installed: false,
+                message,
+                distro: used_distro,
+                code: Some(code.into()),
+            }
+        }
+    }
+}
+
+fn classify_wsl_error(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unsupported source") {
+        "unsupported_source"
+    } else if lower.contains("not a user linux")
+        || lower.contains("docker") && lower.contains("distro")
+    {
+        "invalid_distro"
+    } else if lower.contains("missing bridge") {
+        "missing_bridge"
+    } else if lower.contains("hook operation failed") {
+        "hook_write_failed"
+    } else if lower.contains("wsl")
+        || lower.contains("wslpath")
+        || lower.contains("no usable wsl")
+        || lower.contains("windows runtime")
+    {
+        "wsl_unavailable"
+    } else {
+        "operation_failed"
     }
 }
 
