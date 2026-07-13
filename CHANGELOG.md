@@ -5,6 +5,19 @@ All notable changes to CodeOrbit (Rust) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-07-13
+
+### Added
+- File-based `error.log` diagnostics via `EventLogger` for API, auth, source, and hook/IPC failures.
+- Richer WSL source APIs: distro list metadata (`name`/`state`/`version`/`default`), operation `distro`/`code`, WSL status `probeOk`/`error`.
+
+### Fixed
+- WSL `wslpath` path conversion no longer strips Windows backslashes; falls back to `/mnt/<drive>/...`.
+- Filter Docker/system WSL distros from install targets; mixed UTF-16/UTF-8 WSL stderr decoding; clearer hook write failures.
+
+### Changed
+- `POST /api/sources/repair-all` documents Windows-only scope (`scope: "windows"`).
+
 ## [0.1.2] - 2026-07-09
 
 ### Fixed
@@ -45,6 +58,7 @@ Initial Rust release — a full migration of the CodeOrbit backend from C# to a 
 - `ClaudeMatcherStrategy` performs surgical install/uninstall that preserves the user's
   own non-CodeOrbit Claude hooks.
 
+[0.1.3]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.3
 [0.1.2]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.2
 [0.1.1]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.1
 [0.1.0]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.0
