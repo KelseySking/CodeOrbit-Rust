@@ -1,6 +1,8 @@
 //! HubState — 中央状态机：会话、待处理操作（权限/问题）生命周期与实时事件广播
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,22 +29,28 @@ const REALTIME_CHANNEL_CAPACITY: usize = 256;
 /// 自动审批判定函数
 pub type AutoApprove = Box<dyn Fn(&PermissionRequest) -> bool + Send + Sync>;
 
-/// 队列中的待处理权限请求
+/// 单个阻塞 hook 连接的等待者（合流后同一 pending 可有多个）
+struct PendingWaiter {
+    event: HookEvent,
+    completion: oneshot::Sender<String>,
+}
+
+/// 队列中的待处理权限请求（multi-waiter：Claude PreToolUse + PermissionRequest 合流）
 struct PendingPermission {
     action_id: String,
     created_at: DateTime<Utc>,
     request: PermissionRequest,
-    completion: oneshot::Sender<String>,
-    event: HookEvent,
+    waiters: Vec<PendingWaiter>,
+    dedupe_key: Option<String>,
 }
 
-/// 队列中的待处理问题
+/// 队列中的待处理问题（multi-waiter）
 struct PendingQuestion {
     action_id: String,
     created_at: DateTime<Utc>,
     question: QuestionData,
-    completion: oneshot::Sender<String>,
-    event: HookEvent,
+    waiters: Vec<PendingWaiter>,
+    dedupe_key: Option<String>,
     current_question_index: i32,
     answers: Vec<(String, Vec<String>)>,
 }
@@ -207,66 +215,21 @@ impl HubState {
         self.emit(session_id.as_deref(), None, rt, None);
     }
 
-    /// 阻塞事件第一阶段：应用事件、创建待处理操作（如需要）
+    /// 阻塞事件第一阶段：应用事件、创建待处理操作（如需要）。
+    ///
+    /// Claude 同一工具调用可能同时触发 `PreToolUse` 与 `PermissionRequest`（或
+    /// AskUserQuestion 双事件）。此处按 dedupe key 合流为单条 pending，
+    /// multi-waiter fan-out 解析。
     pub fn begin_blocking_event(&mut self, evt: HookEvent) -> BlockingOutcome {
         let (session_id, normalized, effect) = self.apply_event(&evt);
         let rt = to_realtime_event_type(normalized.as_deref(), &effect);
 
         let outcome = match &effect {
             SideEffect::ShowApprovalCard { request, .. } => {
-                let auto = self
-                    .should_auto_approve
-                    .as_ref()
-                    .map(|f| f(request))
-                    .unwrap_or(false);
-                if auto {
-                    BlockingOutcome::Immediate(
-                        hook_response_builder::build_permission_allow_response(
-                            &evt,
-                            Some(request),
-                            false,
-                        ),
-                    )
-                } else {
-                    let (tx, rx) = oneshot::channel();
-                    let action_id = new_action_id("permission");
-                    let sid = request.session_id.clone();
-                    self.permission_queue.push_back(PendingPermission {
-                        action_id: action_id.clone(),
-                        created_at: Utc::now(),
-                        request: request.clone(),
-                        completion: tx,
-                        event: evt.clone(),
-                    });
-                    BlockingOutcome::Pending(Box::new(PendingHandle {
-                        action_id,
-                        session_id: Some(sid),
-                        kind: "permission",
-                        event: evt.clone(),
-                        rx,
-                    }))
-                }
+                self.begin_permission_blocking(evt.clone(), request.clone())
             }
             SideEffect::ShowQuestionCard { question, .. } => {
-                let (tx, rx) = oneshot::channel();
-                let action_id = new_action_id("question");
-                let sid = question.session_id.clone();
-                self.question_queue.push_back(PendingQuestion {
-                    action_id: action_id.clone(),
-                    created_at: Utc::now(),
-                    question: question.clone(),
-                    completion: tx,
-                    event: evt.clone(),
-                    current_question_index: 0,
-                    answers: Vec::new(),
-                });
-                BlockingOutcome::Pending(Box::new(PendingHandle {
-                    action_id,
-                    session_id: Some(sid),
-                    kind: "question",
-                    event: evt.clone(),
-                    rx,
-                }))
+                self.begin_question_blocking(evt.clone(), question.clone())
             }
             // 无卡片效果：等同于超时拒绝/关闭（mirror C# 行为，但即时返回）
             _ => BlockingOutcome::Immediate(build_timeout_response(&evt)),
@@ -276,7 +239,143 @@ impl HubState {
         outcome
     }
 
-    /// 阻塞超时处理：移除待处理操作并记录，返回拒绝/关闭响应
+    fn begin_permission_blocking(
+        &mut self,
+        evt: HookEvent,
+        request: PermissionRequest,
+    ) -> BlockingOutcome {
+        let dedupe_key = permission_dedupe_key(&request, &evt);
+
+        if let Some(key) = dedupe_key.as_ref()
+            && let Some(pos) = self.find_permission_by_key(key)
+        {
+            let (tx, rx) = oneshot::channel();
+            let pending = &mut self.permission_queue[pos];
+            // 后到事件可回填展示字段
+            if pending.request.tool_use_id.is_none() {
+                if let Some(id) = request
+                    .tool_use_id
+                    .clone()
+                    .or_else(|| evt.tool_use_id.clone())
+                {
+                    pending.request.tool_use_id = Some(id);
+                }
+            }
+            if pending.request.description.is_none() && request.description.is_some() {
+                pending.request.description = request.description.clone();
+            }
+            if pending.request.tool_input.is_none() && request.tool_input.is_some() {
+                pending.request.tool_input = request.tool_input.clone();
+            }
+            let action_id = pending.action_id.clone();
+            let sid = pending.request.session_id.clone();
+            pending.waiters.push(PendingWaiter {
+                event: evt.clone(),
+                completion: tx,
+            });
+            return BlockingOutcome::Pending(Box::new(PendingHandle {
+                action_id,
+                session_id: Some(sid),
+                kind: "permission",
+                event: evt,
+                rx,
+            }));
+        }
+
+        let auto = self
+            .should_auto_approve
+            .as_ref()
+            .map(|f| f(&request))
+            .unwrap_or(false);
+        if auto {
+            return BlockingOutcome::Immediate(
+                hook_response_builder::build_permission_allow_response(&evt, Some(&request), false),
+            );
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let action_id = new_action_id("permission");
+        let sid = request.session_id.clone();
+        self.permission_queue.push_back(PendingPermission {
+            action_id: action_id.clone(),
+            created_at: Utc::now(),
+            request,
+            waiters: vec![PendingWaiter {
+                event: evt.clone(),
+                completion: tx,
+            }],
+            dedupe_key,
+        });
+        BlockingOutcome::Pending(Box::new(PendingHandle {
+            action_id,
+            session_id: Some(sid),
+            kind: "permission",
+            event: evt,
+            rx,
+        }))
+    }
+
+    fn begin_question_blocking(
+        &mut self,
+        evt: HookEvent,
+        question: QuestionData,
+    ) -> BlockingOutcome {
+        let dedupe_key = question_dedupe_key(&question, &evt);
+
+        if let Some(key) = dedupe_key.as_ref()
+            && let Some(pos) = self.find_question_by_key(key)
+        {
+            let (tx, rx) = oneshot::channel();
+            let pending = &mut self.question_queue[pos];
+            if pending.question.id.is_none() && question.id.is_some() {
+                pending.question.id = question.id.clone();
+            }
+            if pending.question.question.is_empty() && !question.question.is_empty() {
+                pending.question.question = question.question.clone();
+            }
+            if pending.question.original_input.is_none() && question.original_input.is_some() {
+                pending.question.original_input = question.original_input.clone();
+            }
+            let action_id = pending.action_id.clone();
+            let sid = pending.question.session_id.clone();
+            pending.waiters.push(PendingWaiter {
+                event: evt.clone(),
+                completion: tx,
+            });
+            return BlockingOutcome::Pending(Box::new(PendingHandle {
+                action_id,
+                session_id: Some(sid),
+                kind: "question",
+                event: evt,
+                rx,
+            }));
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let action_id = new_action_id("question");
+        let sid = question.session_id.clone();
+        self.question_queue.push_back(PendingQuestion {
+            action_id: action_id.clone(),
+            created_at: Utc::now(),
+            question,
+            waiters: vec![PendingWaiter {
+                event: evt.clone(),
+                completion: tx,
+            }],
+            dedupe_key,
+            current_question_index: 0,
+            answers: Vec::new(),
+        });
+        BlockingOutcome::Pending(Box::new(PendingHandle {
+            action_id,
+            session_id: Some(sid),
+            kind: "question",
+            event: evt,
+            rx,
+        }))
+    }
+
+    /// 阻塞超时处理：take 幂等；首个 timeout fan-out 所有 waiters，后续只返回响应字符串
     pub fn resolve_timeout(
         &mut self,
         action_id: &str,
@@ -284,32 +383,64 @@ impl HubState {
         kind: &str,
         evt: &HookEvent,
     ) -> String {
-        let removed = match kind {
-            "permission" => self.take_permission(action_id).is_some(),
-            "question" => self.take_question(action_id).is_some(),
-            _ => false,
-        };
-
-        if removed {
-            let resolution = PendingResolutionDto {
-                action_id: action_id.to_string(),
-                kind: kind.to_string(),
-                session_id: session_id.map(str::to_string),
-                source: None,
-                decision: "timeout".to_string(),
-                actor: None,
-                reason: Some("timeout".to_string()),
-                resolved_at_utc: Utc::now(),
-            };
-            self.record_history(resolution.clone());
-            self.emit(
-                session_id,
-                Some(action_id),
-                "pending.resolved",
-                Some(&resolution),
-            );
-        } else {
-            self.emit(session_id, None, "pending.updated", None);
+        match kind {
+            "permission" => {
+                if let Some(pending) = self.take_permission(action_id) {
+                    let resolution = PendingResolutionDto {
+                        action_id: action_id.to_string(),
+                        kind: kind.to_string(),
+                        session_id: session_id.map(str::to_string),
+                        source: None,
+                        decision: "timeout".to_string(),
+                        actor: None,
+                        reason: Some("timeout".to_string()),
+                        resolved_at_utc: Utc::now(),
+                    };
+                    self.record_history(resolution.clone());
+                    for waiter in pending.waiters {
+                        let response = build_timeout_response(&waiter.event);
+                        let _ = waiter.completion.send(response);
+                    }
+                    self.emit(
+                        session_id,
+                        Some(action_id),
+                        "pending.resolved",
+                        Some(&resolution),
+                    );
+                } else {
+                    self.emit(session_id, None, "pending.updated", None);
+                }
+            }
+            "question" => {
+                if let Some(pending) = self.take_question(action_id) {
+                    let resolution = PendingResolutionDto {
+                        action_id: action_id.to_string(),
+                        kind: kind.to_string(),
+                        session_id: session_id.map(str::to_string),
+                        source: None,
+                        decision: "timeout".to_string(),
+                        actor: None,
+                        reason: Some("timeout".to_string()),
+                        resolved_at_utc: Utc::now(),
+                    };
+                    self.record_history(resolution.clone());
+                    for waiter in pending.waiters {
+                        let response = build_timeout_response(&waiter.event);
+                        let _ = waiter.completion.send(response);
+                    }
+                    self.emit(
+                        session_id,
+                        Some(action_id),
+                        "pending.resolved",
+                        Some(&resolution),
+                    );
+                } else {
+                    self.emit(session_id, None, "pending.updated", None);
+                }
+            }
+            _ => {
+                self.emit(session_id, None, "pending.updated", None);
+            }
         }
 
         build_timeout_response(evt)
@@ -339,12 +470,14 @@ impl HubState {
         };
         self.record_history(resolution.clone());
 
-        let response = hook_response_builder::build_permission_allow_response(
-            &pending.event,
-            Some(&pending.request),
-            always,
-        );
-        let _ = pending.completion.send(response);
+        for waiter in pending.waiters {
+            let response = hook_response_builder::build_permission_allow_response(
+                &waiter.event,
+                Some(&pending.request),
+                always,
+            );
+            let _ = waiter.completion.send(response);
+        }
         self.emit(
             Some(&pending.request.session_id),
             Some(&pending.action_id),
@@ -376,9 +509,11 @@ impl HubState {
         };
         self.record_history(resolution.clone());
 
-        let response =
-            hook_response_builder::build_permission_deny_response(&pending.event, reason);
-        let _ = pending.completion.send(response);
+        for waiter in pending.waiters {
+            let response =
+                hook_response_builder::build_permission_deny_response(&waiter.event, reason);
+            let _ = waiter.completion.send(response);
+        }
         self.emit(
             Some(&pending.request.session_id),
             Some(&pending.action_id),
@@ -450,12 +585,15 @@ impl HubState {
             reason: None,
             resolved_at_utc: Utc::now(),
         };
-        let response = hook_response_builder::build_question_answer_response(
-            &pending.event,
-            &pending.question,
-            &pending.answers,
-        );
-        let _ = pending.completion.send(response);
+        self.record_history(resolution.clone());
+        for waiter in pending.waiters {
+            let response = hook_response_builder::build_question_answer_response(
+                &waiter.event,
+                &pending.question,
+                &pending.answers,
+            );
+            let _ = waiter.completion.send(response);
+        }
         self.emit(
             Some(&pending.question.session_id),
             Some(action_id),
@@ -506,12 +644,14 @@ impl HubState {
         };
         self.record_history(resolution.clone());
 
-        let response = hook_response_builder::build_question_answer_response(
-            &pending.event,
-            &pending.question,
-            &pending.answers,
-        );
-        let _ = pending.completion.send(response);
+        for waiter in pending.waiters {
+            let response = hook_response_builder::build_question_answer_response(
+                &waiter.event,
+                &pending.question,
+                &pending.answers,
+            );
+            let _ = waiter.completion.send(response);
+        }
         self.emit(
             Some(&pending.question.session_id),
             Some(action_id),
@@ -531,9 +671,6 @@ impl HubState {
             return false;
         };
         let source = self.session_source_key(&pending.question.session_id);
-        let response =
-            hook_response_builder::build_question_dismiss_response(&pending.event, reason);
-        let _ = pending.completion.send(response);
         let resolution = PendingResolutionDto {
             action_id: pending.action_id.clone(),
             kind: "question".to_string(),
@@ -544,6 +681,12 @@ impl HubState {
             reason: Some(reason.to_string()),
             resolved_at_utc: Utc::now(),
         };
+        self.record_history(resolution.clone());
+        for waiter in pending.waiters {
+            let response =
+                hook_response_builder::build_question_dismiss_response(&waiter.event, reason);
+            let _ = waiter.completion.send(response);
+        }
         self.emit(
             Some(&pending.question.session_id),
             Some(action_id),
@@ -681,11 +824,14 @@ impl HubState {
         let mut retained_perms = VecDeque::new();
         while let Some(p) = self.permission_queue.pop_front() {
             if p.request.session_id == session_id {
-                let _ = p
-                    .completion
-                    .send(hook_response_builder::build_permission_deny_response(
-                        &p.event, reason,
-                    ));
+                for waiter in p.waiters {
+                    let _ = waiter.completion.send(
+                        hook_response_builder::build_permission_deny_response(
+                            &waiter.event,
+                            reason,
+                        ),
+                    );
+                }
                 removed = true;
             } else {
                 retained_perms.push_back(p);
@@ -696,11 +842,14 @@ impl HubState {
         let mut retained_questions = VecDeque::new();
         while let Some(q) = self.question_queue.pop_front() {
             if q.question.session_id == session_id {
-                let _ = q
-                    .completion
-                    .send(hook_response_builder::build_question_dismiss_response(
-                        &q.event, reason,
-                    ));
+                for waiter in q.waiters {
+                    let _ = waiter.completion.send(
+                        hook_response_builder::build_question_dismiss_response(
+                            &waiter.event,
+                            reason,
+                        ),
+                    );
+                }
                 removed = true;
             } else {
                 retained_questions.push_back(q);
@@ -709,6 +858,18 @@ impl HubState {
         self.question_queue = retained_questions;
 
         removed
+    }
+
+    fn find_permission_by_key(&self, key: &str) -> Option<usize> {
+        self.permission_queue
+            .iter()
+            .position(|p| p.dedupe_key.as_deref() == Some(key))
+    }
+
+    fn find_question_by_key(&self, key: &str) -> Option<usize> {
+        self.question_queue
+            .iter()
+            .position(|q| q.dedupe_key.as_deref() == Some(key))
     }
 
     fn take_permission(&mut self, action_id: &str) -> Option<PendingPermission> {
@@ -856,6 +1017,134 @@ pub async fn handle_blocking_event(
 
 fn new_action_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// 权限去重键：优先 tool_use_id；否则 tool_name + 稳定 input 指纹。
+/// 无 tool_use_id 且无有效 input → None（不合并）。
+fn permission_dedupe_key(request: &PermissionRequest, evt: &HookEvent) -> Option<String> {
+    let session_id = non_empty(&request.session_id)
+        .or_else(|| evt.session_id.as_deref().and_then(non_empty))?;
+    let tool_use_id = request
+        .tool_use_id
+        .as_deref()
+        .and_then(non_empty)
+        .or_else(|| evt.tool_use_id.as_deref().and_then(non_empty));
+    if let Some(tu) = tool_use_id {
+        return Some(format!("permission|{session_id}|tu:{tu}"));
+    }
+
+    let tool_name = non_empty(&request.tool_name)
+        .or_else(|| evt.tool_name.as_deref().and_then(non_empty))?;
+    let input_fp = fingerprint_permission_input(request, evt)?;
+    Some(format!("permission|{session_id}|fp:{tool_name}|{input_fp}"))
+}
+
+/// 问题去重键：优先 tool_use_id；否则 question id / 文本 / tool_input 指纹。
+fn question_dedupe_key(question: &QuestionData, evt: &HookEvent) -> Option<String> {
+    let session_id = non_empty(&question.session_id)
+        .or_else(|| evt.session_id.as_deref().and_then(non_empty))?;
+    let tool_use_id = evt.tool_use_id.as_deref().and_then(non_empty);
+    if let Some(tu) = tool_use_id {
+        return Some(format!("question|{session_id}|tu:{tu}"));
+    }
+
+    let tool_name = evt.tool_name.as_deref().and_then(non_empty).unwrap_or("");
+    let q_fp = question
+        .id
+        .as_deref()
+        .and_then(non_empty)
+        .map(|id| format!("id:{id}"))
+        .or_else(|| {
+            let text = non_empty(&question.question)?;
+            let count = question
+                .questions
+                .as_ref()
+                .map(|q| q.len())
+                .unwrap_or(0);
+            Some(format!("qt:{text}|n:{count}"))
+        })
+        .or_else(|| {
+            let input = evt.tool_input.as_ref().or(question.original_input.as_ref())?;
+            if is_empty_json(input) {
+                return None;
+            }
+            Some(format!("in:{}", stable_json_fingerprint(input)))
+        })?;
+    Some(format!("question|{session_id}|fp:{tool_name}|{q_fp}"))
+}
+
+fn fingerprint_permission_input(
+    request: &PermissionRequest,
+    evt: &HookEvent,
+) -> Option<String> {
+    if let Some(map) = &request.tool_input
+        && !map.is_empty()
+    {
+        let value = Value::Object(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        return Some(stable_json_fingerprint(&value));
+    }
+    let input = evt.tool_input.as_ref()?;
+    if is_empty_json(input) {
+        return None;
+    }
+    Some(stable_json_fingerprint(input))
+}
+
+/// 对 JSON 做键排序后的稳定指纹（进程内 DefaultHasher，不要求跨进程）。
+fn stable_json_fingerprint(value: &Value) -> String {
+    let mut hasher = DefaultHasher::new();
+    hash_stable_json(value, &mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+fn hash_stable_json(value: &Value, hasher: &mut DefaultHasher) {
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::Number(n) => {
+            2u8.hash(hasher);
+            n.to_string().hash(hasher);
+        }
+        Value::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Array(items) => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                hash_stable_json(item, hasher);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(hasher);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            keys.len().hash(hasher);
+            for key in keys {
+                key.hash(hasher);
+                hash_stable_json(&map[key], hasher);
+            }
+        }
+    }
+}
+
+fn is_empty_json(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Object(m) => m.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::String(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+fn non_empty(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t) }
 }
 
 fn build_timeout_response(evt: &HookEvent) -> String {
@@ -1419,5 +1708,297 @@ mod tests {
         let evt = rx.recv().await.unwrap();
         assert_eq!(evt.event_type, "terminal.activate");
         assert_eq!(evt.data.unwrap()["sessionId"], "s1");
+    }
+
+    // ---------- Claude dual-hook pending dedupe ----------
+
+    fn perm_evt(
+        name: &str,
+        session: &str,
+        tool: &str,
+        tool_use_id: Option<&str>,
+        command: &str,
+    ) -> HookEvent {
+        let mut raw = json!({
+            "hook_event_name": name,
+            "session_id": session,
+            "tool_name": tool,
+            "_source": "claude",
+        });
+        if name == "PreToolUse" {
+            raw["requires_approval"] = json!(true);
+        }
+        let tool_input = json!({"command": command});
+        raw["tool_input"] = tool_input.clone();
+        if let Some(id) = tool_use_id {
+            raw["tool_use_id"] = json!(id);
+        }
+        HookEvent {
+            event_name: name.into(),
+            session_id: Some(session.into()),
+            tool_name: Some(tool.into()),
+            tool_use_id: tool_use_id.map(str::to_string),
+            agent_id: None,
+            tool_input: Some(tool_input),
+            raw_json: raw,
+            source: Some("claude".into()),
+            parent_pid: None,
+            tracked_pid: None,
+            tracked_pid_kind: None,
+            tracked_process_started_at_utc: None,
+        }
+    }
+
+    fn ask_user_question_evt(name: &str, session: &str, tool_use_id: Option<&str>) -> HookEvent {
+        let tool_input = json!({
+            "questions": [{
+                "question": "Pick?",
+                "header": "h",
+                "options": [{"label": "A"}]
+            }]
+        });
+        let mut raw = json!({
+            "hook_event_name": name,
+            "session_id": session,
+            "tool_name": "AskUserQuestion",
+            "tool_input": tool_input,
+            "_source": "claude",
+        });
+        if let Some(id) = tool_use_id {
+            raw["tool_use_id"] = json!(id);
+        }
+        HookEvent {
+            event_name: name.into(),
+            session_id: Some(session.into()),
+            tool_name: Some("AskUserQuestion".into()),
+            tool_use_id: tool_use_id.map(str::to_string),
+            agent_id: None,
+            tool_input: Some(tool_input),
+            raw_json: raw,
+            source: Some("claude".into()),
+            parent_pid: None,
+            tracked_pid: None,
+            tracked_pid_kind: None,
+            tracked_process_started_at_utc: None,
+        }
+    }
+
+    fn take_pending_rx(outcome: BlockingOutcome) -> (String, oneshot::Receiver<String>) {
+        match outcome {
+            BlockingOutcome::Pending(h) => {
+                let h = *h;
+                (h.action_id, h.rx)
+            }
+            BlockingOutcome::Immediate(r) => panic!("expected pending, got immediate: {r}"),
+        }
+    }
+
+    #[test]
+    fn dedupe_permission_by_tool_use_id() {
+        let mut state = HubState::new();
+        let pre = perm_evt("PreToolUse", "s1", "Bash", Some("tu-1"), "ls");
+        let pr = perm_evt("PermissionRequest", "s1", "Bash", Some("tu-1"), "ls");
+
+        let (id1, mut rx1) = take_pending_rx(state.begin_blocking_event(pre));
+        let (id2, mut rx2) = take_pending_rx(state.begin_blocking_event(pr));
+
+        assert_eq!(id1, id2);
+        assert_eq!(state.get_pending_actions().len(), 1);
+        assert_eq!(state.permission_queue[0].waiters.len(), 2);
+
+        assert!(state.allow_permission(&id1, false, None));
+        assert_eq!(state.get_pending_actions().len(), 0);
+
+        let r1 = rx1.try_recv().expect("pre response");
+        let r2 = rx2.try_recv().expect("permission response");
+        let v1: Value = serde_json::from_str(&r1).unwrap();
+        let v2: Value = serde_json::from_str(&r2).unwrap();
+        assert_eq!(v1["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(v1["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(v2["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        assert_eq!(v2["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+    }
+
+    #[test]
+    fn dedupe_permission_by_input_fingerprint() {
+        let mut state = HubState::new();
+        let pre = perm_evt("PreToolUse", "s1", "Bash", None, "echo hi");
+        let pr = perm_evt("PermissionRequest", "s1", "Bash", None, "echo hi");
+
+        let (id1, _) = take_pending_rx(state.begin_blocking_event(pre));
+        let (id2, _) = take_pending_rx(state.begin_blocking_event(pr));
+        assert_eq!(id1, id2);
+        assert_eq!(state.get_pending_actions().len(), 1);
+    }
+
+    #[test]
+    fn no_merge_different_tool_use_id() {
+        let mut state = HubState::new();
+        let a = perm_evt("PreToolUse", "s1", "Bash", Some("tu-a"), "ls");
+        let b = perm_evt("PermissionRequest", "s1", "Bash", Some("tu-b"), "ls");
+
+        let (id1, _) = take_pending_rx(state.begin_blocking_event(a));
+        let (id2, _) = take_pending_rx(state.begin_blocking_event(b));
+        assert_ne!(id1, id2);
+        assert_eq!(state.get_pending_actions().len(), 2);
+    }
+
+    #[test]
+    fn no_merge_empty_fingerprint() {
+        // 无 tool_use_id 且无 tool_input → 不合并
+        let mut state = HubState::new();
+        let a = permission_event("s1", "Bash");
+        let b = permission_event("s1", "Bash");
+        let (id1, _) = take_pending_rx(state.begin_blocking_event(a));
+        let (id2, _) = take_pending_rx(state.begin_blocking_event(b));
+        assert_ne!(id1, id2);
+        assert_eq!(state.get_pending_actions().len(), 2);
+    }
+
+    #[test]
+    fn deny_and_timeout_fanout() {
+        let mut state = HubState::new();
+        let pre = perm_evt("PreToolUse", "s1", "Bash", Some("tu-d"), "rm -rf /");
+        let pr = perm_evt("PermissionRequest", "s1", "Bash", Some("tu-d"), "rm -rf /");
+        let (id, mut rx1) = take_pending_rx(state.begin_blocking_event(pre));
+        let (_, mut rx2) = take_pending_rx(state.begin_blocking_event(pr));
+
+        assert!(state.deny_permission(&id, "blocked", None));
+        let r1 = rx1.try_recv().unwrap();
+        let r2 = rx2.try_recv().unwrap();
+        assert!(r1.contains("permissionDecision") || r1.contains("deny"));
+        assert!(r2.contains("decision") || r2.contains("deny"));
+        let v1: Value = serde_json::from_str(&r1).unwrap();
+        let v2: Value = serde_json::from_str(&r2).unwrap();
+        assert_eq!(v1["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(v2["hookSpecificOutput"]["decision"]["behavior"], "deny");
+
+        // timeout fan-out on a fresh dual pending
+        let mut state = HubState::new();
+        let pre = perm_evt("PreToolUse", "s1", "Bash", Some("tu-t"), "sleep");
+        let pr = perm_evt("PermissionRequest", "s1", "Bash", Some("tu-t"), "sleep");
+        let pre_clone = pre.clone();
+        let (id, mut rx1) = take_pending_rx(state.begin_blocking_event(pre));
+        let (_, mut rx2) = take_pending_rx(state.begin_blocking_event(pr));
+        let resp = state.resolve_timeout(&id, Some("s1"), "permission", &pre_clone);
+        assert!(resp.contains("deny") || resp.contains("timeout"));
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+        // 幂等：第二次 timeout 不 panic
+        let _ = state.resolve_timeout(&id, Some("s1"), "permission", &pre_clone);
+        assert_eq!(state.get_pending_history(10).len(), 1);
+    }
+
+    #[test]
+    fn ask_user_question_dedupe() {
+        let mut state = HubState::new();
+        let pre = ask_user_question_evt("PreToolUse", "s1", Some("q-1"));
+        let pr = ask_user_question_evt("PermissionRequest", "s1", Some("q-1"));
+
+        let (id1, mut rx1) = take_pending_rx(state.begin_blocking_event(pre));
+        let (id2, mut rx2) = take_pending_rx(state.begin_blocking_event(pr));
+        assert_eq!(id1, id2);
+        assert_eq!(state.get_pending_actions().len(), 1);
+        assert_eq!(state.get_pending_actions()[0].kind, "question");
+
+        let answered = state.answer_current_question(&id1, vec!["A".into()], None);
+        assert_eq!(answered, (true, true));
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+        assert_eq!(state.get_pending_actions().len(), 0);
+        let history = state.get_pending_history(10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].decision, "answered");
+    }
+
+    #[test]
+    fn single_event_regression() {
+        let mut state = HubState::new();
+        let outcome = state.begin_blocking_event(permission_event("s1", "Bash"));
+        let (id, mut rx) = take_pending_rx(outcome);
+        assert_eq!(state.get_pending_actions().len(), 1);
+        assert!(state.allow_permission(&id, false, None));
+        let r = rx.try_recv().unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    }
+
+    #[test]
+    fn auto_approve_first_then_second_new() {
+        let mut state = HubState::with_auto_approve(Some(Box::new(|req| req.tool_name == "Bash")));
+        // 首条 Immediate allow（无 pending 可挂接）
+        let o1 = state.begin_blocking_event(perm_evt(
+            "PreToolUse",
+            "s1",
+            "Bash",
+            Some("auto-1"),
+            "echo",
+        ));
+        assert!(matches!(o1, BlockingOutcome::Immediate(_)));
+        assert_eq!(state.get_pending_actions().len(), 0);
+
+        // 无 auto 时再来一条应新建
+        let mut state = HubState::new();
+        let o = state.begin_blocking_event(perm_evt(
+            "PermissionRequest",
+            "s1",
+            "Bash",
+            Some("auto-2"),
+            "echo",
+        ));
+        assert!(matches!(o, BlockingOutcome::Pending(_)));
+    }
+
+    #[test]
+    fn pending_exists_second_attaches_not_auto() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // 第一次 auto=false 建卡；第二次若误走 auto 路径会 Immediate（auto=true）
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cb = calls.clone();
+        let mut state = HubState::with_auto_approve(Some(Box::new(move |_| {
+            // 第 0 次调用返回 false；之后 true
+            calls_cb.fetch_add(1, Ordering::SeqCst) > 0
+        })));
+
+        let pre = perm_evt("PreToolUse", "s1", "Bash", Some("no-ghost"), "y");
+        let (id1, mut rx1) = take_pending_rx(state.begin_blocking_event(pre));
+        assert_eq!(state.get_pending_actions().len(), 1);
+
+        let pr = perm_evt("PermissionRequest", "s1", "Bash", Some("no-ghost"), "y");
+        let outcome = state.begin_blocking_event(pr);
+        match outcome {
+            BlockingOutcome::Pending(mut h) => {
+                assert_eq!(h.action_id, id1);
+                // attach 路径不应再次调用 auto（仍为 1 次）
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(state.allow_permission(&id1, false, None));
+                let _ = rx1.try_recv();
+                let _ = h.rx.try_recv();
+            }
+            BlockingOutcome::Immediate(_) => panic!("should attach, not auto"),
+        }
+        assert_eq!(state.get_pending_actions().len(), 0);
+
+        // 首条 auto Immediate 后不留幽灵 pending
+        let mut state = HubState::with_auto_approve(Some(Box::new(|_| true)));
+        let o = state.begin_blocking_event(perm_evt(
+            "PreToolUse",
+            "s1",
+            "Bash",
+            Some("ghost"),
+            "x",
+        ));
+        assert!(matches!(o, BlockingOutcome::Immediate(_)));
+        assert_eq!(state.get_pending_actions().len(), 0);
+        let o2 = state.begin_blocking_event(perm_evt(
+            "PermissionRequest",
+            "s1",
+            "Bash",
+            Some("ghost"),
+            "x",
+        ));
+        assert!(matches!(o2, BlockingOutcome::Immediate(_)));
+        assert_eq!(state.get_pending_actions().len(), 0);
     }
 }
