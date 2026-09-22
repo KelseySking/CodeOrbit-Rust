@@ -48,7 +48,9 @@ pub fn get_question_tool_kind(tool_name: Option<&str>) -> HookQuestionToolKind {
     let Some(name) = tool_name else {
         return HookQuestionToolKind::None;
     };
-    if name.eq_ignore_ascii_case("AskUserQuestion") {
+    if name.eq_ignore_ascii_case("AskUserQuestion")
+        || name.eq_ignore_ascii_case("ask_user_question")
+    {
         return HookQuestionToolKind::AskUserQuestion;
     }
     if name.eq_ignore_ascii_case("request_user_input")

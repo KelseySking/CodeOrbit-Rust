@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
-use tokio::sync::{RwLock, broadcast, oneshot};
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, oneshot, RwLock};
 
 use codeorbit_contracts::{
     ChatMessageDto, HubEventDto, PendingActionDto, PendingResolutionDto, PermissionRequestDto,
@@ -1161,7 +1161,8 @@ fn is_question_event(evt: &HookEvent, normalized: &str) -> bool {
     if hook_tool_classifier::should_block_question_tool(evt, normalized) {
         return true;
     }
-    if !normalized.starts_with("Question") && normalized != "Notification" {
+    // Notification 不是问答。当问答会让普通通知一直等 hook 回包。
+    if !normalized.starts_with("Question") {
         return false;
     }
     contains_any(Some(&evt.raw_json), &["question", "questions"])

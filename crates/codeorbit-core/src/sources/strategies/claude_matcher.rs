@@ -5,22 +5,21 @@
 
 use std::path::Path;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use super::super::hook_installation_utils::{
     expand_path, get_hook_command, read_json_file, write_json_file,
 };
 use super::super::plugin_models::HookInstallationSpec;
-use super::{HookInstallationStrategy, is_codeorbit_hook_command};
+use super::{is_codeorbit_hook_command, HookInstallationStrategy};
 
 pub struct ClaudeMatcherStrategy;
 
 impl ClaudeMatcherStrategy {
-    /// Claude 事件超时：PreToolUse / PermissionRequest / Notification 需 86400s
+    /// 只有会等用户作答的事件才拉长超时。Notification 立刻返回，避免普通通知挂死回合。
     fn timeout_for_event(event_name: &str, default_timeout: i32) -> i32 {
         if event_name.eq_ignore_ascii_case("PreToolUse")
             || event_name.eq_ignore_ascii_case("PermissionRequest")
-            || event_name.eq_ignore_ascii_case("Notification")
         {
             86400
         } else {

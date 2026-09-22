@@ -55,6 +55,8 @@ pub fn build_question_answer_response(
 pub fn build_question_dismiss_response(evt: &HookEvent, reason: &str) -> String {
     if hook_tool_classifier::is_codex_request_user_input(evt) {
         codex::build_request_user_input_dismiss_response(evt, reason)
+    } else if !is_codex_style(evt) && hook_tool_classifier::is_ask_user_question(evt) {
+        claude::build_question_deny_response(evt, reason)
     } else {
         legacy::build_question_dismiss_response(reason)
     }
