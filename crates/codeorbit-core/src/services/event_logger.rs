@@ -136,6 +136,11 @@ pub fn log_error(category: &str, message: &str, fields: &[(&str, &str)]) {
     global().write_error(category, message, fields);
 }
 
+/// 快捷写 hook.log
+pub fn log_hook(category: &str, message: &str, fields: &[(&str, &str)]) {
+    global().write_hook(category, message, fields);
+}
+
 fn append(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = fs::OpenOptions::new()

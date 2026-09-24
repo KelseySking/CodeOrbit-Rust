@@ -45,4 +45,13 @@ pub struct SessionDto {
     pub terminal_session_id: Option<String>,
     pub recent_messages: Vec<ChatMessageDto>,
     pub tool_history: Vec<ToolHistoryEntryDto>,
+    /// 在飞的后台任务数。只有 claude 写，其它源为 0。
+    #[serde(default)]
+    pub background_active: u32,
+    /// 最近一轮的结果：unspecified / succeeded / failed。只有 claude 写。
+    #[serde(default)]
+    pub turn_outcome: String,
+    /// 当前权限档位。只有 claude 写，读不到为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }

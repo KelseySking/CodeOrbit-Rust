@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    AgentStatus, ChatMessage, HookEvent, PermissionRequest, QuestionData, QuestionItem,
-    QuestionOption, SideEffect, SupportedSource, ToolHistoryEntry,
+    AgentStatus, ChatMessage, HookEvent, PermissionMode, PermissionRequest, QuestionData,
+    QuestionItem, QuestionOption, SideEffect, SupportedSource, ToolHistoryEntry, TurnOutcome,
 };
 use crate::services::{
     hook_tool_classifier,
@@ -51,6 +51,15 @@ pub struct SessionSnapshot {
     pub terminal_app: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_session_id: Option<String>,
+    /// 在飞的后台任务数。只有 claude 写，其它源保持 0。
+    #[serde(default)]
+    pub background_active: u32,
+    /// 最近一轮的结果。只有 claude 写。
+    #[serde(default)]
+    pub turn_outcome: TurnOutcome,
+    /// 当前权限档位。只有 claude 写，读不到就是未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
 }
 
 const MAX_TOOL_HISTORY_ENTRIES: usize = 50;
@@ -81,6 +90,9 @@ impl SessionSnapshot {
             transcript_position: 0,
             terminal_app: None,
             terminal_session_id: None,
+            background_active: 0,
+            turn_outcome: TurnOutcome::Unspecified,
+            permission_mode: None,
         }
     }
 
@@ -113,6 +125,9 @@ impl SessionSnapshot {
         };
 
         let normalized_event = Self::normalize_event_name(&state.source, &evt.event_name);
+        if state.source.eq_ignore_ascii_case("claude") {
+            state.permission_mode = read_permission_mode(&evt.raw_json).or(state.permission_mode);
+        }
 
         let (new_state, effect) = match normalized_event.as_str() {
             "UserPromptSubmit" => Self::handle_user_prompt_submit(state, evt),
@@ -177,6 +192,26 @@ impl SessionSnapshot {
                 state.last_updated_at = Utc::now();
                 (state, SideEffect::None)
             }
+            "Stop" if state.source.eq_ignore_ascii_case("claude") => {
+                state.background_active = count_background_tasks(&evt.raw_json);
+                if state.background_active > 0 {
+                    state.status = AgentStatus::Running;
+                    state.last_updated_at = Utc::now();
+                    (state, SideEffect::None)
+                } else {
+                    state.turn_outcome = TurnOutcome::Succeeded;
+                    Self::handle_stop(state, evt)
+                }
+            }
+            "StopFailure" if state.source.eq_ignore_ascii_case("claude") => {
+                state.background_active = 0;
+                state.turn_outcome = TurnOutcome::Failed;
+                state.status = AgentStatus::Idle;
+                state.current_tool_name = None;
+                state.current_tool_description = None;
+                state.last_updated_at = Utc::now();
+                (state, SideEffect::None)
+            }
             "Stop" => Self::handle_stop(state, evt),
             "SessionEnd" => {
                 state.status = AgentStatus::Idle;
@@ -186,6 +221,11 @@ impl SessionSnapshot {
                 (state, SideEffect::None)
             }
             "SessionStart" => Self::handle_session_start(state, evt),
+            "SubagentStart" if state.source.eq_ignore_ascii_case("claude") => {
+                state.background_active = state.background_active.saturating_add(1);
+                state.last_updated_at = Utc::now();
+                (state, SideEffect::None)
+            }
             "SubagentStart" => {
                 state.status = AgentStatus::Running;
                 state.current_tool_name = Some("Agent".to_string());
@@ -194,10 +234,22 @@ impl SessionSnapshot {
                 state.last_updated_at = Utc::now();
                 (state, SideEffect::None)
             }
+            "SubagentStop" if state.source.eq_ignore_ascii_case("claude") => {
+                state.background_active = state.background_active.saturating_sub(1);
+                if state.background_active == 0 && state.status == AgentStatus::Running {
+                    state.status = AgentStatus::Idle;
+                }
+                state.last_updated_at = Utc::now();
+                (state, SideEffect::None)
+            }
             "SubagentStop" => {
                 state.status = AgentStatus::Processing;
                 state.current_tool_name = None;
                 state.current_tool_description = None;
+                state.last_updated_at = Utc::now();
+                (state, SideEffect::None)
+            }
+            "PreCompact" if state.source.eq_ignore_ascii_case("claude") => {
                 state.last_updated_at = Utc::now();
                 (state, SideEffect::None)
             }
@@ -334,7 +386,16 @@ impl SessionSnapshot {
     }
 
     fn handle_user_prompt_submit(mut state: Self, evt: &HookEvent) -> (Self, SideEffect) {
-        state.status = AgentStatus::Processing;
+        // claude 的「在干活」只由 hook 决定，UserPromptSubmit 就是开工。
+        // 其它源保持 Processing，和改动前一致。
+        state.status = if state.source.eq_ignore_ascii_case("claude") {
+            AgentStatus::Running
+        } else {
+            AgentStatus::Processing
+        };
+        if state.source.eq_ignore_ascii_case("claude") {
+            state.background_active = 0;
+        }
         state.current_tool_name = None;
         state.current_tool_description = None;
 
@@ -435,6 +496,11 @@ impl SessionSnapshot {
     fn handle_session_start(mut state: Self, evt: &HookEvent) -> (Self, SideEffect) {
         state = Self::apply_event_metadata(state, evt);
         state.status = AgentStatus::Idle;
+        if state.source.eq_ignore_ascii_case("claude") {
+            state.turn_outcome = TurnOutcome::Unspecified;
+            state.background_active = 0;
+            state.permission_mode = None;
+        }
         state.last_updated_at = Utc::now();
 
         if let Some(term_app) = get_string_field(&evt.raw_json, &["_term_app"]) {
@@ -846,6 +912,69 @@ fn get_string_field(json: &serde_json::Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// 终态词表，照搬 pebrel `payload.rs`。缺失或未知状态按仍在飞处理。
+const TERMINAL_TASK_STATUSES: &[&str] = &[
+    "completed", "complete", "done", "success", "succeeded", "finished", "exited", "failed",
+    "failure", "error", "timeout", "timed_out", "expired", "terminated", "cancelled", "canceled",
+    "stopped", "killed", "aborted", "idle",
+];
+
+/// claude `Stop` payload 里仍在飞的后台任务数。没有 `background_tasks` 返回 0。
+fn count_background_tasks(payload: &serde_json::Value) -> u32 {
+    fn walk(value: &serde_json::Value, active: &mut u32) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, active);
+                }
+            }
+            serde_json::Value::Object(task) => {
+                let is_entry = task.get("type").and_then(|v| v.as_str()).is_some()
+                    || task.get("status").and_then(|v| v.as_str()).is_some();
+                if !is_entry {
+                    for child in task.values() {
+                        walk(child, active);
+                    }
+                    return;
+                }
+                if task_in_flight(task) {
+                    *active = active.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut active = 0;
+    if let Some(tasks) = payload.get("background_tasks") {
+        walk(tasks, &mut active);
+    }
+    active
+}
+
+fn task_in_flight(task: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let idle_teammate = task
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("in_process_teammate"))
+        && task.get("isIdle").and_then(|v| v.as_bool()) == Some(true);
+    if idle_teammate {
+        return false;
+    }
+    match task.get("status").and_then(|v| v.as_str()) {
+        Some(status) => !TERMINAL_TASK_STATUSES.contains(&status.to_ascii_lowercase().as_str()),
+        None => true,
+    }
+}
+
+/// 从 payload 读权限档位。读不到或未知字符串返回 None，调用方保持上次的值。
+fn read_permission_mode(payload: &serde_json::Value) -> Option<PermissionMode> {
+    ["permission_mode", "permissionMode"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(|v| v.as_str()))
+        .and_then(PermissionMode::parse)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,7 +1001,7 @@ mod tests {
         .unwrap();
 
         let (state, effect) = SessionSnapshot::reduce_event(None, &evt);
-        assert_eq!(state.status, AgentStatus::Processing);
+        assert_eq!(state.status, AgentStatus::Running);
         assert_eq!(state.last_user_prompt, Some("Hello world".to_string()));
         assert!(matches!(effect, SideEffect::None));
     }
@@ -930,6 +1059,138 @@ mod tests {
 
         let (state, _) = SessionSnapshot::reduce_event(None, &evt);
         assert_eq!(state.project_name.as_deref(), Some("Explicit"));
+    }
+
+    fn claude_event(name: &str, extra: serde_json::Value) -> HookEvent {
+        let mut payload = serde_json::Map::new();
+        payload.insert("hook_event_name".to_string(), json!(name));
+        payload.insert("session_id".to_string(), json!("s1"));
+        if let serde_json::Value::Object(more) = extra {
+            payload.extend(more);
+        }
+        HookEvent::from_json(&serde_json::Value::Object(payload), Some("claude")).unwrap()
+    }
+
+    #[test]
+    fn claude_stop_with_inflight_background_task_stays_running() {
+        let evt = claude_event(
+            "Stop",
+            json!({"background_tasks": [{"type": "local_bash", "status": "running"}]}),
+        );
+        let (state, effect) = SessionSnapshot::reduce_event(None, &evt);
+        assert_eq!(state.status, AgentStatus::Running);
+        assert_eq!(state.background_active, 1);
+        assert!(matches!(effect, SideEffect::None));
+    }
+
+    #[test]
+    fn claude_stop_without_background_tasks_goes_idle() {
+        let (state, _) = SessionSnapshot::reduce_event(None, &claude_event("Stop", json!({})));
+        assert_eq!(state.status, AgentStatus::Idle);
+        assert_eq!(state.background_active, 0);
+    }
+
+    #[test]
+    fn idle_teammate_does_not_count_as_inflight() {
+        let evt = claude_event(
+            "Stop",
+            json!({"background_tasks": [
+                {"type": "in_process_teammate", "status": "running", "isIdle": true}
+            ]}),
+        );
+        let (state, _) = SessionSnapshot::reduce_event(None, &evt);
+        assert_eq!(state.background_active, 0);
+        assert_eq!(state.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn claude_subagent_stop_returns_to_idle_once_count_hits_zero() {
+        let start = claude_event("SubagentStart", json!({}));
+        let (state, _) = SessionSnapshot::reduce_event(None, &start);
+        assert_eq!(state.status, AgentStatus::Idle);
+        assert_eq!(state.background_active, 1);
+
+        let (state, _) = SessionSnapshot::reduce_event(Some(state), &claude_event("SubagentStop", json!({})));
+        assert_eq!(state.background_active, 0);
+        assert_eq!(state.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn claude_permission_mode_is_read_and_does_not_change_status() {
+        let bypass = claude_event("Stop", json!({"permission_mode": "bypassPermissions"}));
+        let (state, _) = SessionSnapshot::reduce_event(None, &bypass);
+        assert_eq!(state.permission_mode, Some(PermissionMode::BypassPermissions));
+        assert_eq!(state.status, AgentStatus::Idle);
+
+        let alias = claude_event("PreToolUse", json!({"permission_mode": "accept_edits"}));
+        let (state, _) = SessionSnapshot::reduce_event(Some(state), &alias);
+        assert_eq!(state.permission_mode, Some(PermissionMode::AcceptEdits));
+
+        let unknown = claude_event("PreToolUse", json!({"permission_mode": "yolo"}));
+        let (state, _) = SessionSnapshot::reduce_event(Some(state), &unknown);
+        assert_eq!(state.permission_mode, Some(PermissionMode::AcceptEdits));
+
+        let (state, _) = SessionSnapshot::reduce_event(Some(state), &claude_event("SessionStart", json!({})));
+        assert_eq!(state.permission_mode, None);
+    }
+
+    #[test]
+    fn claude_stop_failure_marks_turn_failed() {
+        let (state, _) = SessionSnapshot::reduce_event(None, &claude_event("StopFailure", json!({})));
+        assert_eq!(state.status, AgentStatus::Idle);
+        assert_eq!(state.turn_outcome, TurnOutcome::Failed);
+        assert_eq!(state.background_active, 0);
+    }
+
+    #[test]
+    fn claude_stop_marks_turn_succeeded_only_when_idle() {
+        let (idle, _) = SessionSnapshot::reduce_event(None, &claude_event("Stop", json!({})));
+        assert_eq!(idle.turn_outcome, TurnOutcome::Succeeded);
+
+        let busy = claude_event(
+            "Stop",
+            json!({"background_tasks": [{"type": "local_bash", "status": "running"}]}),
+        );
+        let (busy, _) = SessionSnapshot::reduce_event(None, &busy);
+        assert_eq!(busy.turn_outcome, TurnOutcome::Unspecified);
+    }
+
+    #[test]
+    fn tool_failure_does_not_change_turn_outcome() {
+        let (state, _) = SessionSnapshot::reduce_event(None, &claude_event("Stop", json!({})));
+        let (state, _) =
+            SessionSnapshot::reduce_event(Some(state), &claude_event("PostToolUseFailure", json!({})));
+        assert_eq!(state.turn_outcome, TurnOutcome::Succeeded);
+    }
+
+    #[test]
+    fn claude_user_prompt_submit_is_running() {
+        let (state, _) =
+            SessionSnapshot::reduce_event(None, &claude_event("UserPromptSubmit", json!({"prompt": "go"})));
+        assert_eq!(state.status, AgentStatus::Running);
+        assert_eq!(state.background_active, 0);
+    }
+
+    #[test]
+    fn claude_pre_compact_keeps_status() {
+        let running = claude_event("UserPromptSubmit", json!({"prompt": "go"}));
+        let (state, _) = SessionSnapshot::reduce_event(None, &running);
+        let before = state.status;
+
+        let (state, _) = SessionSnapshot::reduce_event(Some(state), &claude_event("PreCompact", json!({})));
+        assert_eq!(state.status, before);
+    }
+
+    #[test]
+    fn codex_subagent_start_still_sets_running() {
+        let evt = HookEvent::from_json(
+            &json!({"hook_event_name": "SubagentStart", "session_id": "s1"}),
+            Some("codex"),
+        )
+        .unwrap();
+        let (state, _) = SessionSnapshot::reduce_event(None, &evt);
+        assert_eq!(state.status, AgentStatus::Running);
+        assert_eq!(state.background_active, 0);
     }
 
     #[test]

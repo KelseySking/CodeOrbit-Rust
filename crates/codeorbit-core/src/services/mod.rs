@@ -19,11 +19,11 @@ mod codex_hook_response_builder;
 mod legacy_question_response_builder;
 
 pub use codex_home::resolve_codex_home;
-pub use event_logger::{EventLogger, LogKind, log_error};
+pub use event_logger::{log_error, log_hook, EventLogger, LogKind};
 pub use event_normalizer::{normalize_event_name, normalize_field_name};
 pub use hook_tool_classifier::HookQuestionToolKind;
 pub use l10n::L10n;
 pub use legacy_question_response_builder::Answers;
 pub use session_persistence::SessionPersistence;
 pub use settings_manager::SettingsManager;
-pub use transcript_message_reader::{TranscriptReadResult, read_new_messages};
+pub use transcript_message_reader::{read_new_messages, TranscriptReadResult};

@@ -146,6 +146,8 @@ All routes below are under `/api`.
 
 `SessionDto.TerminalApp` and `SessionDto.TerminalSessionId` are nullable terminal metadata hints. Display clients should prefer `/sessions/{sessionId}/activate-terminal` for the user action and treat these fields as optional display/activation hints.
 
+For Claude sessions, `SessionDto.Status`, `SessionDto.TurnOutcome` (`unspecified` / `succeeded` / `failed`), `SessionDto.PermissionMode` (`default` / `acceptEdits` / `bypassPermissions` / `plan`, absent when unknown) and `SessionDto.BackgroundActive` are computed by the Runtime from Claude hook events. Display clients must not infer Claude activity from process liveness or terminal contents. `PermissionMode` is a standing mode, not a pending approval; a `bypassPermissions` session is not waiting. Other sources leave `TurnOutcome` as `unspecified`, `PermissionMode` absent and `BackgroundActive` at 0. Older clients that ignore the new fields keep working.
+
 ## WebSocket Events
 
 Clients connect to `/api/events` with the same token rules. The server sends JSON payloads shaped as `HubEventDto`:

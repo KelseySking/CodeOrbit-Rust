@@ -90,6 +90,8 @@ query token 主要用于简单 WebSocket 客户端和本地工具。UI 客户端
 | Pending actions | `GET /pending`, `GET /pending/{actionId}`, `POST /permissions/{actionId}/allow`, `POST /permissions/{actionId}/deny`, `POST /questions/{actionId}/answer`, `POST /questions/{actionId}/answer-current`, `POST /questions/{actionId}/dismiss` |
 | Realtime | `WS /events?token=<token>` |
 
+Claude 会话的 `status`、`turnOutcome`（`unspecified` / `succeeded` / `failed`）、`permissionMode`（`default` / `acceptEdits` / `bypassPermissions` / `plan`，读不到则缺省）、`backgroundActive` 由 Runtime 根据 Claude hook 计算。展示端不得用进程是否存活或终端内容另行推断。`permissionMode` 是持续档位，不是一次待审批；`bypassPermissions` 的会话并不在等人。其它源的 `turnOutcome` 保持 `unspecified`，`permissionMode` 缺省，`backgroundActive` 为 0。不认识这些字段的旧展示端仍可照常工作。
+
 ## WebSocket Events
 
 客户端用相同 token 规则连接 `/api/events`。服务端发送 `HubEventDto`：

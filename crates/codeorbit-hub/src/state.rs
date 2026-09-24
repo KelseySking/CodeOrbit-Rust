@@ -16,12 +16,12 @@ use codeorbit_contracts::{
     ToolHistoryEntryDto,
 };
 use codeorbit_core::models::{
-    ChatMessage, HookEvent, PermissionRequest, QuestionData, QuestionItem, QuestionOption,
-    SessionSnapshot, SideEffect, SupportedSource, ToolHistoryEntry,
+    ChatMessage, HookEvent, PermissionMode, PermissionRequest, QuestionData, QuestionItem,
+    QuestionOption, SessionSnapshot, SideEffect, SupportedSource, ToolHistoryEntry, TurnOutcome,
 };
 use codeorbit_core::services::hook_response_builder;
 use codeorbit_core::services::transcript_message_reader::read_new_messages;
-use codeorbit_core::services::{hook_tool_classifier, normalize_event_name};
+use codeorbit_core::services::{hook_tool_classifier, log_hook, normalize_event_name};
 
 const MAX_HISTORY_ENTRIES: usize = 200;
 const REALTIME_CHANNEL_CAPACITY: usize = 256;
@@ -111,6 +111,9 @@ pub struct HubState {
     history: VecDeque<PendingResolutionDto>,
     should_auto_approve: Option<AutoApprove>,
     events: broadcast::Sender<HubEventDto>,
+    /// claude 会话已收工。终态之后迟到的工具事件丢掉，直到下一个 UserPromptSubmit。
+    /// 不进 DTO。ponytail: 布尔而非序号，claude hook 没有单调序号。
+    claude_turn_closed: HashMap<String, bool>,
 }
 
 impl HubState {
@@ -127,6 +130,7 @@ impl HubState {
             history: VecDeque::new(),
             should_auto_approve,
             events,
+            claude_turn_closed: HashMap::new(),
         }
     }
 
@@ -354,6 +358,7 @@ impl HubState {
         let (tx, rx) = oneshot::channel();
         let action_id = new_action_id("question");
         let sid = question.session_id.clone();
+        log_question("received", &action_id, &sid, &evt, &question.question);
         self.question_queue.push_back(PendingQuestion {
             action_id: action_id.clone(),
             created_at: Utc::now(),
@@ -413,6 +418,7 @@ impl HubState {
             }
             "question" => {
                 if let Some(pending) = self.take_question(action_id) {
+                    log_pending_question("timeout", &pending);
                     let resolution = PendingResolutionDto {
                         action_id: action_id.to_string(),
                         kind: kind.to_string(),
@@ -574,6 +580,7 @@ impl HubState {
         }
 
         let pending = self.question_queue.remove(pos).expect("position valid");
+        log_pending_question("answered", &pending);
         let source = self.session_source_key(&pending.question.session_id);
         let resolution = PendingResolutionDto {
             action_id: pending.action_id.clone(),
@@ -670,6 +677,7 @@ impl HubState {
         let Some(pending) = self.take_question(action_id) else {
             return false;
         };
+        log_pending_question("dismissed", &pending);
         let source = self.session_source_key(&pending.question.session_id);
         let resolution = PendingResolutionDto {
             action_id: pending.action_id.clone(),
@@ -756,7 +764,13 @@ impl HubState {
     // ---------- 内部 ----------
 
     fn apply_event(&mut self, evt: &HookEvent) -> (Option<String>, Option<String>, SideEffect) {
+        if claude_foreign_payload(evt) {
+            return (None, None, SideEffect::None);
+        }
         let resolved = self.resolve_session_id(evt);
+        if self.claude_event_stale(evt, resolved.as_deref()) {
+            return (resolved, None, SideEffect::None);
+        }
         let existing = resolved
             .as_ref()
             .and_then(|id| self.sessions.get(id))
@@ -779,12 +793,51 @@ impl HubState {
             };
 
         if normalized == "SessionEnd" {
+            // 先记终态再删：删掉之后 note 读不到 source，迟到的 PreToolUse
+            // 会按同一个 session id 解析回来并把会话标回在干活。
+            self.note_claude_turn(&session_id, &normalized);
             self.remove_session(&session_id, "session ended");
         } else {
             self.sessions.insert(session_id.clone(), new_state);
+            self.note_claude_turn(&session_id, &normalized);
         }
 
         (Some(session_id), Some(normalized), effect)
+    }
+
+    /// 终态之后、下一轮 UserPromptSubmit 之前，迟到的工具事件不能把会话标回在干活。
+    fn claude_event_stale(&self, evt: &HookEvent, session_id: Option<&str>) -> bool {
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        if !evt.source.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("claude")) {
+            return false;
+        }
+        if !self.claude_turn_closed.get(session_id).copied().unwrap_or(false) {
+            return false;
+        }
+        matches!(
+            evt.event_name.as_str(),
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "SubagentStart"
+        )
+    }
+
+    fn note_claude_turn(&mut self, session_id: &str, normalized: &str) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        if !session.source.eq_ignore_ascii_case("claude") {
+            return;
+        }
+        let closed = match normalized {
+            "UserPromptSubmit" => Some(false),
+            "Stop" => Some(session.background_active == 0),
+            "StopFailure" | "SessionEnd" => Some(true),
+            _ => None,
+        };
+        if let Some(closed) = closed {
+            self.claude_turn_closed.insert(session_id.to_string(), closed);
+        }
     }
 
     fn resolve_session_id(&self, evt: &HookEvent) -> Option<String> {
@@ -1147,6 +1200,56 @@ fn non_empty(s: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
+/// claude 自己只用 snake_case `hook_event_name`。带 camelCase `hookEventName`
+/// 的是别家 runner 串进来的载荷，整条丢弃。
+fn claude_foreign_payload(evt: &HookEvent) -> bool {
+    evt.source.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("claude"))
+        && evt.raw_json.get("hookEventName").is_some()
+}
+
+fn log_question(phase: &str, action_id: &str, session_id: &str, evt: &HookEvent, text: &str) {
+    let preview: String = text.chars().take(120).collect();
+    log_hook(
+        "question",
+        phase,
+        &[
+            ("action", action_id),
+            ("session", session_id),
+            ("event", evt.event_name.as_str()),
+            ("tool", evt.tool_name.as_deref().unwrap_or("")),
+            ("text", preview.as_str()),
+        ],
+    );
+}
+
+fn log_pending_question(phase: &str, pending: &PendingQuestion) {
+    let evt = pending
+        .waiters
+        .first()
+        .map(|waiter| &waiter.event);
+    let fallback = HookEvent {
+        event_name: String::new(),
+        session_id: None,
+        tool_name: None,
+        tool_use_id: None,
+        agent_id: None,
+        tool_input: None,
+        raw_json: Value::Null,
+        source: None,
+        parent_pid: None,
+        tracked_pid: None,
+        tracked_pid_kind: None,
+        tracked_process_started_at_utc: None,
+    };
+    log_question(
+        phase,
+        &pending.action_id,
+        &pending.question.session_id,
+        evt.unwrap_or(&fallback),
+        &pending.question.question,
+    );
+}
+
 fn build_timeout_response(evt: &HookEvent) -> String {
     let normalized =
         normalize_event_name(evt.source.as_deref().unwrap_or("unknown"), &evt.event_name);
@@ -1343,6 +1446,22 @@ fn map_session(session: &SessionSnapshot) -> SessionDto {
         terminal_session_id: session.terminal_session_id.clone(),
         recent_messages: session.recent_messages.iter().map(map_message).collect(),
         tool_history: session.tool_history.iter().map(map_tool_history).collect(),
+        background_active: session.background_active,
+        turn_outcome: match session.turn_outcome {
+            TurnOutcome::Unspecified => "unspecified",
+            TurnOutcome::Succeeded => "succeeded",
+            TurnOutcome::Failed => "failed",
+        }
+        .to_string(),
+        permission_mode: session.permission_mode.map(|mode| {
+            match mode {
+                PermissionMode::Default => "default",
+                PermissionMode::AcceptEdits => "acceptEdits",
+                PermissionMode::BypassPermissions => "bypassPermissions",
+                PermissionMode::Plan => "plan",
+            }
+            .to_string()
+        }),
     }
 }
 
@@ -1476,6 +1595,58 @@ mod tests {
             tracked_pid_kind: None,
             tracked_process_started_at_utc: None,
         }
+    }
+
+    fn claude_named(session_id: &str, event_name: &str) -> HookEvent {
+        HookEvent {
+            event_name: event_name.to_string(),
+            session_id: Some(session_id.to_string()),
+            raw_json: json!({ "hook_event_name": event_name, "session_id": session_id }),
+            source: Some("claude".to_string()),
+            ..session_start(session_id)
+        }
+    }
+
+    #[test]
+    fn camel_case_hook_event_name_is_dropped_for_claude() {
+        let mut state = HubState::new();
+        state.handle_event(&session_start("s1"));
+        let before = state.get_session("s1").unwrap().last_updated_at_utc;
+
+        let mut foreign = claude_named("s1", "PreToolUse");
+        foreign.raw_json = json!({ "hookEventName": "PreToolUse", "session_id": "s1" });
+        state.handle_event(&foreign);
+
+        assert_eq!(state.get_session("s1").unwrap().last_updated_at_utc, before);
+        assert_eq!(state.get_session("s1").unwrap().status, "Idle");
+    }
+
+    #[test]
+    fn stale_pre_tool_use_after_stop_does_not_revive_session() {
+        let mut state = HubState::new();
+        state.handle_event(&session_start("s1"));
+        state.handle_event(&claude_named("s1", "UserPromptSubmit"));
+        state.handle_event(&claude_named("s1", "Stop"));
+        assert_eq!(state.get_session("s1").unwrap().status, "Idle");
+
+        state.handle_event(&claude_named("s1", "PreToolUse"));
+        assert_eq!(state.get_session("s1").unwrap().status, "Idle");
+
+        state.handle_event(&claude_named("s1", "UserPromptSubmit"));
+        state.handle_event(&claude_named("s1", "PreToolUse"));
+        assert_eq!(state.get_session("s1").unwrap().status, "Running");
+    }
+
+    #[test]
+    fn stale_pre_tool_use_after_stop_failure_does_not_revive_session() {
+        let mut state = HubState::new();
+        state.handle_event(&session_start("s1"));
+        state.handle_event(&claude_named("s1", "StopFailure"));
+        assert_eq!(state.get_session("s1").unwrap().status, "Idle");
+        assert_eq!(state.get_session("s1").unwrap().turn_outcome, "failed");
+
+        state.handle_event(&claude_named("s1", "PreToolUse"));
+        assert_eq!(state.get_session("s1").unwrap().status, "Idle");
     }
 
     fn session_start_without_id(pid: u32, started_at: &str) -> HookEvent {

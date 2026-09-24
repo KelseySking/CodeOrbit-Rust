@@ -22,6 +22,7 @@ pub(crate) const STANDARD_EVENTS: &[&str] = &[
     "SessionStart",
     "SessionEnd",
     "Stop",
+    "StopFailure",
     "SubagentStart",
     "SubagentStop",
     "Notification",
