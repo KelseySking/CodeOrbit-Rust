@@ -5,6 +5,17 @@ All notable changes to CodeOrbit (Rust) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-09-24
+
+### Added
+- Claude 会话状态追踪：`turnOutcome`（`unspecified` / `succeeded` / `failed`）标记最近一轮结果；`Stop` 之后迟到的工具事件不再把会话标回在干活。
+- Claude 权限档位：`permissionMode`（`default` / `acceptEdits` / `bypassPermissions` / `plan`）随会话状态持续上报，读不到则缺省。
+- `backgroundActive`：`Stop` 时统计在飞后台任务，主会话未结束的 Agent / Task 工具调用一并计入，至 `PostToolUse` 递减。
+- 插件事件新增 `StopFailure`，并记录 question / hook 诊断日志（hook.log）。
+
+### Fixed
+- 丢弃带 camelCase `hookEventName` 的串源载荷，避免别家 runner 事件污染 Claude 会话。
+
 ## [0.1.4] - 2026-09-22
 
 ### Fixed
@@ -64,6 +75,7 @@ Initial Rust release — a full migration of the CodeOrbit backend from C# to a 
 - `ClaudeMatcherStrategy` performs surgical install/uninstall that preserves the user's
   own non-CodeOrbit Claude hooks.
 
+[0.1.5]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.5
 [0.1.4]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.4
 [0.1.3]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.3
 [0.1.2]: https://github.com/KelseySking/CodeOrbit-Rust/releases/tag/v0.1.2
