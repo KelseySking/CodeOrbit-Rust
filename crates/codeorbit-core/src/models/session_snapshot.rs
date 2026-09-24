@@ -60,6 +60,9 @@ pub struct SessionSnapshot {
     /// 当前权限档位。只有 claude 写，读不到就是未知。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    /// 主会话里还没结束的 Agent 工具调用。不进 API，避免和 SubagentStart 重复计数。
+    #[serde(default, skip)]
+    agent_tool_uses: Vec<String>,
 }
 
 const MAX_TOOL_HISTORY_ENTRIES: usize = 50;
@@ -93,6 +96,7 @@ impl SessionSnapshot {
             background_active: 0,
             turn_outcome: TurnOutcome::Unspecified,
             permission_mode: None,
+            agent_tool_uses: Vec::new(),
         }
     }
 
@@ -177,6 +181,9 @@ impl SessionSnapshot {
                 let description = Self::format_tool_description(evt);
 
                 state.status = AgentStatus::Running;
+                if state.source.eq_ignore_ascii_case("claude") {
+                    note_agent_tool_started(&mut state, evt, tool_name.as_deref());
+                }
                 state.current_tool_name = tool_name;
                 state.current_tool_description = description;
                 state.last_updated_at = Utc::now();
@@ -193,7 +200,8 @@ impl SessionSnapshot {
                 (state, SideEffect::None)
             }
             "Stop" if state.source.eq_ignore_ascii_case("claude") => {
-                state.background_active = count_background_tasks(&evt.raw_json);
+                let reported = count_background_tasks(&evt.raw_json);
+                state.background_active = reported.max(state.agent_tool_uses.len() as u32);
                 if state.background_active > 0 {
                     state.status = AgentStatus::Running;
                     state.last_updated_at = Utc::now();
@@ -395,6 +403,7 @@ impl SessionSnapshot {
         };
         if state.source.eq_ignore_ascii_case("claude") {
             state.background_active = 0;
+            state.agent_tool_uses.clear();
         }
         state.current_tool_name = None;
         state.current_tool_description = None;
@@ -430,6 +439,9 @@ impl SessionSnapshot {
             .tool_name
             .clone()
             .or_else(|| state.current_tool_name.clone());
+        if state.source.eq_ignore_ascii_case("claude") {
+            note_agent_tool_finished(&mut state, evt, tool_name.as_deref());
+        }
         if let Some(tool_name) = tool_name {
             let entry = ToolHistoryEntry {
                 tool_name,
@@ -912,6 +924,45 @@ fn get_string_field(json: &serde_json::Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// 主会话自己的 Agent 工具调用。SubagentStart 记的是子会话，两边不重复。
+fn is_agent_tool(name: Option<&str>) -> bool {
+    name.is_some_and(|name| name.eq_ignore_ascii_case("Agent") || name.eq_ignore_ascii_case("Task"))
+}
+
+fn agent_tool_key(evt: &HookEvent) -> String {
+    evt.tool_use_id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "agent".to_string())
+}
+
+fn note_agent_tool_started(state: &mut SessionSnapshot, evt: &HookEvent, tool_name: Option<&str>) {
+    if !is_agent_tool(tool_name) {
+        return;
+    }
+    let key = agent_tool_key(evt);
+    if !state.agent_tool_uses.iter().any(|existing| existing == &key) {
+        state.agent_tool_uses.push(key);
+    }
+    state.background_active = state.background_active.max(state.agent_tool_uses.len() as u32);
+}
+
+fn note_agent_tool_finished(state: &mut SessionSnapshot, evt: &HookEvent, tool_name: Option<&str>) {
+    if !is_agent_tool(tool_name) && evt.tool_use_id.is_none() {
+        return;
+    }
+    let key = agent_tool_key(evt);
+    let before = state.agent_tool_uses.len();
+    if evt.tool_use_id.is_some() {
+        state.agent_tool_uses.retain(|existing| existing != &key);
+    } else if is_agent_tool(tool_name) {
+        state.agent_tool_uses.pop();
+    }
+    if state.agent_tool_uses.len() < before {
+        state.background_active = state.background_active.saturating_sub(1);
+    }
+}
+
 /// 终态词表，照搬 pebrel `payload.rs`。缺失或未知状态按仍在飞处理。
 const TERMINAL_TASK_STATUSES: &[&str] = &[
     "completed", "complete", "done", "success", "succeeded", "finished", "exited", "failed",
@@ -1113,6 +1164,30 @@ mod tests {
         let (state, _) = SessionSnapshot::reduce_event(Some(state), &claude_event("SubagentStop", json!({})));
         assert_eq!(state.background_active, 0);
         assert_eq!(state.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn claude_agent_tool_counts_until_post_tool_use() {
+        let start = claude_event(
+            "PreToolUse",
+            json!({"tool_name": "Agent", "tool_use_id": "tu-1"}),
+        );
+        let (state, _) = SessionSnapshot::reduce_event(None, &start);
+        assert_eq!(state.background_active, 1);
+
+        let other = claude_event(
+            "PreToolUse",
+            json!({"tool_name": "Bash", "tool_use_id": "tu-2"}),
+        );
+        let (state, _) = SessionSnapshot::reduce_event(Some(state), &other);
+        assert_eq!(state.background_active, 1);
+
+        let done = claude_event(
+            "PostToolUse",
+            json!({"tool_name": "Agent", "tool_use_id": "tu-1"}),
+        );
+        let (state, _) = SessionSnapshot::reduce_event(Some(state), &done);
+        assert_eq!(state.background_active, 0);
     }
 
     #[test]
